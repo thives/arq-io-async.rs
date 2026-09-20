@@ -1,0 +1,17 @@
+{
+  "name": "cobs_async",
+  "image": "rust:latest",
+  "remoteUser": "vscode",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": "true",
+      "upgradePackages": "true",
+      "configureZshAsDefaultShell": "true"
+    },
+    "ghcr.io/devcontainers/features/git:1": {
+      "version": "latest",
+      "ppa": "false"
+    }
+  }
+}
+// TODO: Add cargo features for just, fmt, clippy, cargo-llvm-cov, and cargo-nextest. Also add embedded target for testing: thumbv7em-none-eabihf
