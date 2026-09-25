@@ -23,10 +23,9 @@ defmt = ["dep:defmt", "embedded-io-async?/defmt"]
 defmt = { version = "1", optional = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 embedded-io-async = { version = "0.7", default-features = false, optional = true }
-tokio = { version = "1.53", default-features = false, optional = true }
-
-[dev-dependencies]
+tokio = { version = "1.53", default-features = false, optional = true, features = ["io-util"] }
 crc = { version = "3.4" }
+futures = { version = "0.3", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -10,7 +10,7 @@ check:
   cargo check --all-features
 
 embedded:
-  cargo build --target thumbv7em-none-eabihf --no-default-features
+  cargo build --target thumbv7em-none-eabihf --no-default-features --features "embedded-io"
 
 test:
   cargo nextest r --all-features
