@@ -1,3 +1,54 @@
+//! Asynchronous ARQ (Automatic Repeat reQuest) layer for unreliable point-to-point links.
+//!
+//! The layer wraps a duplex byte-stream channel and exposes a reliable,
+//! in-order, bidirectional byte stream. Frames are retransmitted until they are
+//! acknowledged and out-of-order frames are buffered until their predecessors
+//! arrive, so the reader sees exactly the bytes the peer wrote, in order.
+//!
+//! The layer is a single polled state machine without internal tasks; it makes
+//! progress whenever it is polled through one of its two async interfaces:
+//!
+//! - `tokio::io::AsyncRead` / `tokio::io::AsyncWrite`, enabled by the `tokio`
+//!   feature (default). Any `AsyncRead + AsyncWrite + Unpin` stream can be used
+//!   as the channel.
+//! - `embedded_io_async::Read` / `embedded_io_async::Write`, enabled by the
+//!   `embedded-io` feature. Use `embedded_io::EiaLower` to adapt your stream to
+//!   the channel interface.
+//!
+//! One instance is one link: the peer must run its own instance on the other
+//! end of the channel.
+//!
+//! ## Building an instance
+//!
+//! Instances are built through [`ArqLayer`], which fixes the retransmission
+//! window `N` and carries the CRC algorithm and ACK codec:
+//!
+//! ```no_run
+//! use arq_io_async::{ArqLayer, r};
+//! use tokio::io::{AsyncReadExt, AsyncWriteExt};
+//!
+//! let (mut rx, _tx) = tokio::io::duplex(1024);
+//! let layer = ArqLayer::<8, _, _>::new();
+//! let mut arq = layer.build::<16, { r::<8>() }, _>(rx);
+//!
+//! let _ = async {
+//!     arq.write_all(b"hello").await?;
+//!     arq.flush().await?;
+//!     let mut buf = [0u8; 5];
+//!     arq.read_exact(&mut buf).await
+//! };
+//! ```
+//!
+//! `16` is the codeword length of the default ACK codec, and `r::<8>()` is the
+//! minimum read buffer size for a window of `8`.
+//!
+//! ## Closing the link
+//!
+//! `AsyncWrite::shutdown` flushes any pending data in a final `FIN` frame and
+//! signals end-of-stream to the peer. Afterwards `write` fails with
+//! [`ArqError::Closed`], and the peer's `read` returns `0` bytes once its
+//! stream is drained.
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
 mod ack_codec;
@@ -18,17 +69,19 @@ use ::futures::task::AtomicWaker;
 use core::marker::PhantomData;
 use core::task::{Context, Poll};
 
-pub use crate::ack_codec::AckCodec;
+pub use crate::ack_codec::{AckCodec, BchAckCodec};
 pub use crate::crc::Crc16;
 pub use crate::error::{AckError, ArqError, FrameError};
 pub use crate::frame::{AckFrame, MAX_SEQ};
 
-use crate::ack_codec::CodeRsAckCodec;
 use crate::frame::{DatFrame, Frame, MAX_PAYLOAD};
 use crate::transport::FrameIo;
 
 pub(crate) const MAX_FRAME: usize = 256;
 
+/// Minimum size, in bytes, of the read buffer for a retransmission window of `N`.
+///
+/// [`ArqLayer::build`] requires `R >= r::<N>()`.
 pub const fn r<const N: usize>() -> usize {
     2 * N * MAX_PAYLOAD
 }
@@ -107,6 +160,27 @@ impl<const N: usize> Ring<N> {
     }
 }
 
+/// A reliable, in-order byte stream over an unreliable duplex channel.
+///
+/// `Arq` has no methods of its own; drive it through
+/// `tokio::io::AsyncRead` / `tokio::io::AsyncWrite` (feature `tokio`) or
+/// `embedded_io_async::Read` / `embedded_io_async::Write` (feature
+/// `embedded-io`). Construct instances with [`ArqLayer::build`].
+///
+/// Parameters:
+///
+/// - `N`: retransmission window, in frames. Must be even and in `2..=32`.
+/// - `M`: ACK codeword length, in bytes. Must match the `AckCodecType` in
+///   use, i.e. [`AckCodec<M>`].
+/// - `R`: read buffer size, in bytes. Must be at least `r::<N>()`.
+/// - `Channel`: the underlying byte-stream channel. With feature `tokio` this
+///   is any `AsyncRead + AsyncWrite + Unpin` stream; with feature
+///   `embedded-io`, wrap the stream in `embedded_io::EiaLower`.
+/// - `Crc`: the [`Crc16`] algorithm used to protect frames.
+/// - `AckCodecType`: the [`AckCodec`] used to protect ACK frames.
+///
+/// Reading returns `Ok(0)` when the peer has closed its stream and the buffer
+/// is drained. Writing after the link is closed fails with [`ArqError::Closed`].
 #[derive(Debug)]
 pub struct Arq<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType>
 where
@@ -639,6 +713,11 @@ where
     }
 }
 
+/// Builder for [`Arq`] instances.
+///
+/// Carries the retransmission window `N`, the frame CRC algorithm, and the ACK
+/// codec type. [`ArqLayer::new`] uses the defaults: CRC-16/X-25 and the
+/// built-in error-correcting ACK codec.
 pub struct ArqLayer<const N: usize, Crc, AckCodecType>
 where
     Crc: Clone,
@@ -647,7 +726,11 @@ where
     p_ack_codec: PhantomData<fn() -> AckCodecType>,
 }
 
-impl<const N: usize> ArqLayer<N, ::crc::Crc<u16>, CodeRsAckCodec> {
+impl<const N: usize> ArqLayer<N, ::crc::Crc<u16>, BchAckCodec> {
+    /// Creates a layer with a retransmission window of `N` and the default CRC
+    /// and ACK codec.
+    ///
+    /// Panics if `N` is not even or not in `2..=32`.
     pub fn new() -> Self {
         assert!((2..=32).contains(&N), "N must be between 2 and 32");
         assert!(N.is_multiple_of(2), "N must be even");
@@ -658,16 +741,21 @@ impl<const N: usize> ArqLayer<N, ::crc::Crc<u16>, CodeRsAckCodec> {
     }
 }
 
-impl<const N: usize> Default for ArqLayer<N, ::crc::Crc<u16>, CodeRsAckCodec> {
+/// Equivalent to [`ArqLayer::new`].
+impl<const N: usize> Default for ArqLayer<N, ::crc::Crc<u16>, BchAckCodec> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize, Crc> ArqLayer<N, Crc, CodeRsAckCodec>
+impl<const N: usize, Crc> ArqLayer<N, Crc, BchAckCodec>
 where
     Crc: Clone,
 {
+    /// Replaces the ACK codec type with `AckCodecType`.
+    ///
+    /// `M`, the codeword length, is chosen at [`ArqLayer::build`] and must
+    /// match the codec.
     pub fn with_ack_codec_type<AckCodecType>(self) -> ArqLayer<N, Crc, AckCodecType> {
         ArqLayer {
             crc: self.crc,
@@ -680,6 +768,7 @@ impl<const N: usize, Crc, AckCodecType> ArqLayer<N, Crc, AckCodecType>
 where
     Crc: Clone,
 {
+    /// Replaces the frame CRC algorithm with `crc`.
     pub fn with_crc<NewCrc>(self, crc: NewCrc) -> ArqLayer<N, NewCrc, AckCodecType>
     where
         NewCrc: Crc16 + Clone,
@@ -695,6 +784,10 @@ impl<const N: usize, Crc, AckCodecType> ArqLayer<N, Crc, AckCodecType>
 where
     Crc: Crc16 + Clone,
 {
+    /// Builds an [`Arq`] over `channel`.
+    ///
+    /// `M` must be the codeword length of `AckCodecType`, and `R` must be at
+    /// least `r::<N>()`.
     pub fn build<const M: usize, const R: usize, Channel>(
         &self,
         channel: Channel,

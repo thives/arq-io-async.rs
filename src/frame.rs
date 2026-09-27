@@ -4,6 +4,9 @@ use crate::{
     error::{AckError, FrameError},
 };
 
+/// The maximum frame sequence number.
+///
+/// Sequence numbers are 14 bits and wrap around at this value.
 pub const MAX_SEQ: u16 = 1 << 14;
 
 // Wire format (all multi-byte fields are big-endian):
@@ -23,6 +26,7 @@ pub(crate) const TYPE_FIN: u8 = 0b11;
 
 pub(crate) const MAX_PAYLOAD: usize = MAX_FRAME - 5;
 
+/// A decoded and validated ACK frame.
 #[derive(Debug, Clone, Copy)]
 pub struct AckFrame {
     pkt_id: u16,
@@ -30,6 +34,9 @@ pub struct AckFrame {
 }
 
 impl AckFrame {
+    /// Builds an ACK frame acknowledging all frames below `an`.
+    ///
+    /// Returns [`FrameError::InvalidSeq`] if `an >= MAX_SEQ`.
     pub fn new<C: Crc16>(crc: &C, an: u16) -> Result<Self, FrameError> {
         if an >= MAX_SEQ {
             return Err(FrameError::InvalidSeq(an, MAX_SEQ));
@@ -54,14 +61,19 @@ impl AckFrame {
         Ok(Self { pkt_id, crc: v })
     }
 
+    /// The raw 16-bit packet identifier: 2 type bits plus the 14-bit sequence
+    /// number.
     pub fn pkt_id(&self) -> u16 {
         self.pkt_id
     }
 
+    /// The sequence number carried by the frame, i.e. the next expected
+    /// sequence number.
     pub fn an(&self) -> u16 {
         self.pkt_id >> 2
     }
 
+    /// The CRC-16 over the frame's packet identifier.
     pub fn crc(&self) -> u16 {
         self.crc
     }

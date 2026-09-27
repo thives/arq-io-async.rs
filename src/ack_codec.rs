@@ -3,18 +3,34 @@ use crate::crc::Crc16;
 use crate::error::AckError;
 use crate::frame::AckFrame;
 
+/// Encodes and decodes the error-correcting codeword that carries ACK frames.
+///
+/// The codeword is `ACK_CODEWORD_LEN` bytes long.
 pub trait AckCodec<const ACK_CODEWORD_LEN: usize> {
+    /// Encodes `frame` into the codeword.
     fn encode_ack(frame: AckFrame) -> Result<[u8; ACK_CODEWORD_LEN], AckError>;
+    /// Decodes the codeword into an [`AckFrame`], validating the frame with
+    /// `crc`.
     fn decode_ack<C: Crc16>(
         crc: &C,
         codeword: &[u8; ACK_CODEWORD_LEN],
     ) -> Result<AckFrame, AckError>;
 }
 
+/// A BCH error-correcting [`AckCodec`] for 16-byte codewords.
+///
+/// The codeword carries two 8-byte BCH codewords, each protecting a 16-bit
+/// value and correcting up to 11 bit errors: the frame's packet identifier
+/// in the first half and the frame CRC in the second half.
+///
+/// Decoding fails with [`AckError::DecodeError`] when a half has more bit
+/// errors than it can correct, and with [`AckError::FrameError`] when the
+/// reconstructed frame fails validation.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct CodeRsAckCodec;
+pub struct BchAckCodec;
 
-impl AckCodec<16> for CodeRsAckCodec {
+/// Implements [`AckCodec`] for 16-byte codewords.
+impl AckCodec<16> for BchAckCodec {
     fn encode_ack(frame: AckFrame) -> Result<[u8; 16], AckError> {
         let mut result = [0u8; 16];
         result[..8].copy_from_slice(encode(frame.pkt_id()).to_le_bytes().as_slice());

@@ -1,12 +1,21 @@
 use core::fmt;
 
+/// An error produced by the ARQ layer.
+///
+/// `E` is the error type of the underlying channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ArqError<E> {
+    /// An I/O error from the underlying channel.
     Io(E),
+    /// A frame failed validation; see [`FrameError`].
     Framing(FrameError),
+    /// An ACK frame could not be decoded; see [`AckError`].
     InvalidAck(AckError),
+    /// An ACK was not received in time.
     Timeout,
+    /// The link is closed: the channel reached end-of-stream or the link has
+    /// been shut down.
     Closed,
 }
 
@@ -37,16 +46,27 @@ impl<E: defmt::Format> defmt::Format for ArqError<E> {
 
 impl<E: fmt::Debug + fmt::Display> core::error::Error for ArqError<E> {}
 
+/// A framing error: a frame on the wire failed validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FrameError {
+    /// The frame CRC did not match: `(received, computed)`.
     CrcMismatch(u16, u16),
+    /// The frame is invalid.
     Invalid,
+    /// The sequence number is out of range: `(sequence number, maximum)`.
     InvalidSeq(u16, u16),
+    /// The frame is too short; the field holds the number of bytes available.
     TooShort(usize),
+    /// The frame's declared length exceeds the maximum payload; the field
+    /// holds the declared length.
     TooLong(usize),
+    /// The frame's declared length does not match the number of bytes
+    /// received: `(declared, received)`.
     LengthMismatch(usize, usize),
+    /// The frame's type bits are not a known frame type.
     InvalidType(u8),
+    /// The frame's type does not match what was expected.
     TypeMismatch,
 }
 
@@ -111,10 +131,13 @@ impl<E> From<FrameError> for ArqError<E> {
     }
 }
 
+/// An error decoding an ACK frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AckError {
+    /// The ACK codeword could not be decoded.
     DecodeError,
+    /// The decoded ACK frame failed validation.
     FrameError(FrameError),
 }
 impl core::error::Error for AckError {}

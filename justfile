@@ -26,7 +26,7 @@ docs-html:
   RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --all-features --open
 
 coverage:
-  cargo llvm-cov --all-features nextest --lcov --output-path target/llvm-cov/lcov.info
+  cargo llvm-cov --all-features nextest --lcov --output-path target/lcov.info
   cargo llvm-cov --all-features report
 
 coverage-html:

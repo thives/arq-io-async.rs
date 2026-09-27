@@ -41,6 +41,7 @@ where
     std::io::Error::other(e)
 }
 
+/// Reads in-order data from the peer through the ARQ layer.
 impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType> AsyncRead
     for Arq<N, M, R, Channel, Crc, AckCodecType>
 where
@@ -73,6 +74,8 @@ where
     }
 }
 
+/// Writes data to the peer through the ARQ layer. `poll_shutdown` closes the
+/// link towards the peer.
 impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType> AsyncWrite
     for Arq<N, M, R, Channel, Crc, AckCodecType>
 where

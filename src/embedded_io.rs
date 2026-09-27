@@ -1,3 +1,9 @@
+//! The `embedded_io_async` interface for [`Arq`].
+//!
+//! `Arq` implements [`embedded_io_async::Read`] and
+//! [`embedded_io_async::Write`], and [`EiaLower`] adapts an
+//! `embedded_io_async` stream to the channel interface.
+
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -8,7 +14,15 @@ use crate::error::ArqError;
 use crate::transport::FrameIo;
 use crate::{Op, OpOut};
 
-pub struct EiaLower<S>(pub S);
+/// Adapts an `embedded_io_async` stream to the channel interface required by
+/// [`Arq`].
+///
+/// The inner stream must implement both [`embedded_io_async::Read`] and
+/// [`embedded_io_async::Write`].
+pub struct EiaLower<S>(
+    /// The wrapped stream.
+    pub S,
+);
 
 impl<S> FrameIo for EiaLower<S>
 where
@@ -36,6 +50,7 @@ where
     }
 }
 
+/// The error type of [`Arq`] under the `embedded_io_async` interface.
 #[allow(private_bounds)]
 impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, E>
     embedded_io_async::ErrorType for Arq<N, M, R, Channel, Crc, AckCodecType>
@@ -48,6 +63,7 @@ where
     type Error = ArqError<E>;
 }
 
+/// Reads in-order data from the peer through the ARQ layer.
 #[allow(private_bounds)]
 impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, E>
     embedded_io_async::Read for Arq<N, M, R, Channel, Crc, AckCodecType>
@@ -69,6 +85,7 @@ where
     }
 }
 
+/// Writes data to the peer through the ARQ layer.
 #[allow(private_bounds)]
 impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, E>
     embedded_io_async::Write for Arq<N, M, R, Channel, Crc, AckCodecType>
@@ -193,6 +210,7 @@ where
     }
 }
 
+/// Maps [`ArqError`] variants to `embedded_io_async::ErrorKind`.
 impl<E: embedded_io_async::Error> embedded_io_async::Error for ArqError<E> {
     fn kind(&self) -> embedded_io_async::ErrorKind {
         match self {

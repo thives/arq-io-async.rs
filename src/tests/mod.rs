@@ -2,21 +2,21 @@ use core::convert::Infallible;
 use core::task::{Context, Poll, Waker};
 
 use crate::Arq;
-use crate::ack_codec::CodeRsAckCodec;
+use crate::ack_codec::BchAckCodec;
 use crate::error::{ArqError, FrameError};
 use crate::frame::{AckFrame, DatFrame, Frame};
 use crate::transport::FrameIo;
 use crate::{ArqLayer, Op, OpOut, State, r};
 
 type Crc16X25 = ::crc::Crc<u16>;
-type TestArq = Arq<4, 16, { r::<4>() }, MockLink, Crc16X25, CodeRsAckCodec>;
+type TestArq = Arq<4, 16, { r::<4>() }, MockLink, Crc16X25, BchAckCodec>;
 
 fn crc16() -> Crc16X25 {
     Crc16X25::new(&::crc::CRC_16_IBM_SDLC)
 }
 
 fn make_arq() -> TestArq {
-    ArqLayer::<4, Crc16X25, CodeRsAckCodec>::new().build(MockLink::new())
+    ArqLayer::<4, Crc16X25, BchAckCodec>::new().build(MockLink::new())
 }
 
 struct MockLink {
@@ -148,7 +148,7 @@ fn drive_out(
 fn encode_frame(frame: &Frame) -> Vec<u8> {
     let mut buf = [0u8; 256];
     let n = frame
-        .to_bytes::<CodeRsAckCodec, 16>(&mut buf)
+        .to_bytes::<BchAckCodec, 16>(&mut buf)
         .expect("frame encode");
     buf[..n].to_vec()
 }
@@ -169,9 +169,9 @@ fn parse_stream(bytes: &[u8]) -> Vec<Frame> {
     let mut out = Vec::new();
     let mut rest = bytes;
     while !rest.is_empty() {
-        let len = Frame::wire_len::<CodeRsAckCodec, 16, _>(&crc16(), rest).expect("wire len");
-        let frame = Frame::from_bytes::<CodeRsAckCodec, 16, _>(&crc16(), &rest[..len])
-            .expect("frame decode");
+        let len = Frame::wire_len::<BchAckCodec, 16, _>(&crc16(), rest).expect("wire len");
+        let frame =
+            Frame::from_bytes::<BchAckCodec, 16, _>(&crc16(), &rest[..len]).expect("frame decode");
         out.push(frame);
         rest = &rest[len..];
     }
@@ -206,10 +206,8 @@ fn codec_roundtrip() {
     assert_eq!(g.payload(), b"x");
     assert!(g.is_fin());
     let a = AckFrame::new(&crc, 99).unwrap();
-    let n = Frame::Ack(a)
-        .to_bytes::<CodeRsAckCodec, 16>(&mut buf)
-        .unwrap();
-    match Frame::from_bytes::<CodeRsAckCodec, 16, _>(&crc, &buf[..n]).unwrap() {
+    let n = Frame::Ack(a).to_bytes::<BchAckCodec, 16>(&mut buf).unwrap();
+    match Frame::from_bytes::<BchAckCodec, 16, _>(&crc, &buf[..n]).unwrap() {
         Frame::Ack(a2) => assert_eq!(a2.an(), 99),
         other => panic!("unexpected frame: {other:?}"),
     }
@@ -220,16 +218,16 @@ fn framing_errors() {
     let crc = crc16();
     let mut bytes = wire_dat(0, b"hello");
     bytes[9] ^= 0xFF;
-    assert!(Frame::from_bytes::<CodeRsAckCodec, 16, _>(&crc, &bytes).is_err());
+    assert!(Frame::from_bytes::<BchAckCodec, 16, _>(&crc, &bytes).is_err());
     let mut bytes = wire_dat(0, b"hi");
     bytes[0] = 0x00;
     assert!(matches!(
-        Frame::from_bytes::<CodeRsAckCodec, 16, _>(&crc, &bytes),
+        Frame::from_bytes::<BchAckCodec, 16, _>(&crc, &bytes),
         Err(FrameError::InvalidType(0))
     ));
     let bytes = wire_dat(0, b"hello");
     assert!(matches!(
-        Frame::from_bytes::<CodeRsAckCodec, 16, _>(&crc, &bytes[..4]),
+        Frame::from_bytes::<BchAckCodec, 16, _>(&crc, &bytes[..4]),
         Err(FrameError::TooShort(_))
     ));
 }
@@ -239,7 +237,7 @@ fn bch_corruption() {
     let crc = crc16();
     let mut bytes = wire_ack(5);
     bytes[3] ^= 0x01;
-    match Frame::from_bytes::<CodeRsAckCodec, 16, _>(&crc, &bytes).unwrap() {
+    match Frame::from_bytes::<BchAckCodec, 16, _>(&crc, &bytes).unwrap() {
         Frame::Ack(a) => assert_eq!(a.an(), 5),
         other => panic!("unexpected frame: {other:?}"),
     }
@@ -247,7 +245,7 @@ fn bch_corruption() {
     for i in 0..3 {
         bytes[i] ^= 0xFF;
     }
-    match Frame::from_bytes::<CodeRsAckCodec, 16, _>(&crc, &bytes) {
+    match Frame::from_bytes::<BchAckCodec, 16, _>(&crc, &bytes) {
         Err(_) => {}
         Ok(Frame::Ack(a)) => assert_ne!(a.an(), 5),
         Ok(other) => panic!("unexpected frame: {other:?}"),
@@ -659,8 +657,7 @@ impl FrameIo for EofLink {
 
 #[test]
 fn channel_eof_is_closed() {
-    let mut arq =
-        Arq::<4, 16, { r::<4>() }, EofLink, Crc16X25, CodeRsAckCodec>::new(EofLink, crc16());
+    let mut arq = Arq::<4, 16, { r::<4>() }, EofLink, Crc16X25, BchAckCodec>::new(EofLink, crc16());
     let mut cx = noop_cx();
     let mut buf = [0u8; 8];
     let mut op = Op::Read { buf: &mut buf };
@@ -704,7 +701,7 @@ impl FrameIo for FailLink {
 
 #[test]
 fn channel_recv_error_propagates() {
-    let mut arq = Arq::<4, 16, { r::<4>() }, FailLink, Crc16X25, CodeRsAckCodec>::new(
+    let mut arq = Arq::<4, 16, { r::<4>() }, FailLink, Crc16X25, BchAckCodec>::new(
         FailLink {
             fail_recv: true,
             fail_send: false,
@@ -723,7 +720,7 @@ fn channel_recv_error_propagates() {
 
 #[test]
 fn channel_send_error_propagates() {
-    let mut arq = Arq::<4, 16, { r::<4>() }, FailLink, Crc16X25, CodeRsAckCodec>::new(
+    let mut arq = Arq::<4, 16, { r::<4>() }, FailLink, Crc16X25, BchAckCodec>::new(
         FailLink {
             fail_recv: false,
             fail_send: true,
@@ -747,7 +744,7 @@ fn channel_send_error_propagates() {
 
 #[test]
 fn channel_send_eof_is_closed() {
-    let mut arq = Arq::<4, 16, { r::<4>() }, FailLink, Crc16X25, CodeRsAckCodec>::new(
+    let mut arq = Arq::<4, 16, { r::<4>() }, FailLink, Crc16X25, BchAckCodec>::new(
         FailLink {
             fail_recv: false,
             fail_send: false,
@@ -822,7 +819,7 @@ fn fragmented_channel_reads() {
     link.push(wire_dat(1, &[2u8; 10]));
     link.push(wire_fin(2, &[3u8; 5]));
     let mut arq =
-        Arq::<4, 16, { r::<4>() }, TrickleLink, Crc16X25, CodeRsAckCodec>::new(link, crc16());
+        Arq::<4, 16, { r::<4>() }, TrickleLink, Crc16X25, BchAckCodec>::new(link, crc16());
     let mut cx = noop_cx();
     let mut got = Vec::new();
     let mut buf = [0u8; 16];
@@ -917,11 +914,11 @@ impl PartialPeer {
 
     fn poll(&mut self, wire: &mut Vec<u8>) {
         self.rest.extend(core::mem::take(wire));
-        while let Ok(len) = Frame::wire_len::<CodeRsAckCodec, 16, _>(&crc16(), &self.rest) {
+        while let Ok(len) = Frame::wire_len::<BchAckCodec, 16, _>(&crc16(), &self.rest) {
             if self.rest.len() < len {
                 break;
             }
-            let frame = Frame::from_bytes::<CodeRsAckCodec, 16, _>(&crc16(), &self.rest[..len])
+            let frame = Frame::from_bytes::<BchAckCodec, 16, _>(&crc16(), &self.rest[..len])
                 .expect("peer frame decode");
             self.rest.drain(..len);
             if let Frame::Dat(d) | Frame::Fin(d) = frame {
@@ -942,7 +939,7 @@ impl PartialPeer {
 
 #[test]
 fn partial_send_resumes_across_polls() {
-    type PartialArq = Arq<4, 16, { r::<4>() }, PartialLink, Crc16X25, CodeRsAckCodec>;
+    type PartialArq = Arq<4, 16, { r::<4>() }, PartialLink, Crc16X25, BchAckCodec>;
     let mut arq = PartialArq::new(PartialLink::new(16), crc16());
     let mut peer = PartialPeer::new();
     let mut cx = noop_cx();
@@ -1003,7 +1000,7 @@ fn partial_send_resumes_across_polls() {
 fn tokio_duplex_async_read_write() {
     use core::pin::Pin;
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-    type TokArq = Arq<4, 16, { r::<4>() }, DuplexStream, Crc16X25, CodeRsAckCodec>;
+    type TokArq = Arq<4, 16, { r::<4>() }, DuplexStream, Crc16X25, BchAckCodec>;
     #[allow(clippy::too_many_arguments)]
     fn step(
         arq: &mut TokArq,
@@ -1054,8 +1051,8 @@ fn tokio_duplex_async_read_write() {
         }
     }
     let (a_ch, b_ch) = tokio::io::duplex(64);
-    let mut a: TokArq = ArqLayer::<4, Crc16X25, CodeRsAckCodec>::new().build(a_ch);
-    let mut b: TokArq = ArqLayer::<4, Crc16X25, CodeRsAckCodec>::new().build(b_ch);
+    let mut a: TokArq = ArqLayer::<4, Crc16X25, BchAckCodec>::new().build(a_ch);
+    let mut b: TokArq = ArqLayer::<4, Crc16X25, BchAckCodec>::new().build(b_ch);
     let mut cx = noop_cx();
     let da: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
     let db: Vec<u8> = (0..2000u32).map(|i| (i * 7 % 251) as u8).collect();

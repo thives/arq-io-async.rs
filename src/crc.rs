@@ -1,7 +1,11 @@
+/// A CRC-16 algorithm used to protect frames.
 pub trait Crc16 {
+    /// Computes the CRC-16 over the concatenation of `chunks`.
     fn checksum_concat<const N: usize>(&self, chunks: [&[u8]; N]) -> u16;
 }
 
+/// Any closure that computes a CRC-16 over the concatenation of slices can be
+/// used as a [`Crc16`].
 impl<F: Fn(&[&[u8]]) -> u16> Crc16 for F {
     fn checksum_concat<const N: usize>(&self, chunks: [&[u8]; N]) -> u16 {
         self(&chunks)
