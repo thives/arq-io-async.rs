@@ -1,4 +1,14 @@
+[![Crates.io](https://img.shields.io/crates/v/arq-io-async)](https://crates.io/crates/arq-io-async)
+[![docs.rs](https://img.shields.io/docsrs/arq-io-async)](https://docs.rs/arq-io-async)
+[![ci](https://github.com/thives/arq-io-async.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/thives/arq-io-async.rs/actions/workflows/ci.yml)
+
 # arq-io-async
+
+> [!WARNING]
+> This crate is in early development. The API is not yet stable and may change.
+
+> [!CAUTION]
+> This crate is not yet production-ready. It has not been widely tested and may contain bugs.
 
 Asynchronous implementation of ARQ (Automatic Repeat reQuest) in Rust.
 
