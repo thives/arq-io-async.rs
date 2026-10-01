@@ -14,12 +14,13 @@ pub const MAX_SEQ: u16 = 1 << 14;
 // ACK:
 //   [0..M]  BCH codeword (M bytes)
 //
-// DAT / FIN:
+// DAT / DAT+ACK-request / FIN:
 //   [0-1]  an     u16  frame sequence number - 2 bits for type on the low end of the LE u16
 //   [2]    len    u8   payload length
 //   [3-4]  crc16  u16  over bytes [0..4] + payload
 //   [5..]  payload
 
+pub(crate) const TYPE_DAT_ACK_REQ: u8 = 0b00;
 pub(crate) const TYPE_ACK: u8 = 0b01;
 pub(crate) const TYPE_DAT: u8 = 0b10;
 pub(crate) const TYPE_FIN: u8 = 0b11;
@@ -89,22 +90,27 @@ pub(crate) struct DatFrame {
 
 impl DatFrame {
     pub(crate) fn new_dat<C: Crc16>(crc: &C, an: u16, payload: &[u8]) -> Self {
-        Self::new(crc, an, false, payload)
+        Self::new(crc, an, TYPE_DAT, payload)
+    }
+
+    pub(crate) fn new_dat_ack_req<C: Crc16>(crc: &C, an: u16, payload: &[u8]) -> Self {
+        Self::new(crc, an, TYPE_DAT_ACK_REQ, payload)
     }
 
     pub(crate) fn new_fin<C: Crc16>(crc: &C, an: u16, payload: &[u8]) -> Self {
-        Self::new(crc, an, true, payload)
+        Self::new(crc, an, TYPE_FIN, payload)
     }
 
-    fn new<C: Crc16>(crc: &C, an: u16, fin: bool, payload: &[u8]) -> Self {
+    pub(crate) fn to_ack_req<C: Crc16>(self, crc: &C) -> Self {
+        debug_assert!(!self.is_fin());
+        Self::new_dat_ack_req(crc, self.sn(), self.payload())
+    }
+
+    fn new<C: Crc16>(crc: &C, an: u16, ty: u8, payload: &[u8]) -> Self {
         assert!(an < MAX_SEQ);
         assert!(payload.len() <= MAX_PAYLOAD);
         let len = payload.len() as u8;
-        let pkt_id = if fin {
-            TYPE_FIN as u16 | (an << 2)
-        } else {
-            TYPE_DAT as u16 | (an << 2)
-        };
+        let pkt_id = ty as u16 | (an << 2);
         let pkt_id_bytes = pkt_id.to_le_bytes();
         let v = crc.checksum_concat([pkt_id_bytes.as_slice(), [len].as_slice(), payload]);
         let mut this = Self {
@@ -123,7 +129,7 @@ impl DatFrame {
         }
         let pkt_id = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
         let ty = (pkt_id & 0b11) as u8;
-        if ty != TYPE_DAT && ty != TYPE_FIN {
+        if ty == TYPE_ACK {
             return Err(FrameError::TypeMismatch);
         }
         let len = bytes[2] as usize;
@@ -171,16 +177,30 @@ impl DatFrame {
     pub(crate) fn is_fin(&self) -> bool {
         self.pkt_id & 0b11 == TYPE_FIN as u16
     }
+
+    pub(crate) fn requests_ack(&self) -> bool {
+        self.pkt_id & 0b11 == TYPE_DAT_ACK_REQ as u16
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Frame {
     Ack(AckFrame),
     Dat(DatFrame),
+    DatAckReq(DatFrame),
     Fin(DatFrame),
 }
 
 impl Frame {
+    pub(crate) fn from_dat(d: DatFrame) -> Self {
+        if d.is_fin() {
+            Frame::Fin(d)
+        } else if d.requests_ack() {
+            Frame::DatAckReq(d)
+        } else {
+            Frame::Dat(d)
+        }
+    }
     pub(crate) fn wire_len<B: AckCodec<M>, const M: usize, C: Crc16>(
         crc: &C,
         bytes: &[u8],
@@ -193,7 +213,7 @@ impl Frame {
         }
         match bytes.first().copied().map(|b| b & 0b11) {
             None => Err(FrameError::TooShort(0)),
-            Some(TYPE_DAT) | Some(TYPE_FIN) => {
+            Some(TYPE_DAT) | Some(TYPE_DAT_ACK_REQ) | Some(TYPE_FIN) => {
                 if bytes.len() < 3 {
                     return Err(FrameError::TooShort(bytes.len()));
                 }
@@ -218,8 +238,9 @@ impl Frame {
             }
         }
         match bytes.first().copied().ok_or(FrameError::TooShort(0))? & 0b11 {
-            TYPE_DAT => Ok(Frame::Dat(DatFrame::from_bytes(crc, bytes)?)),
-            TYPE_FIN => Ok(Frame::Fin(DatFrame::from_bytes(crc, bytes)?)),
+            TYPE_DAT | TYPE_DAT_ACK_REQ | TYPE_FIN => {
+                Ok(Frame::from_dat(DatFrame::from_bytes(crc, bytes)?))
+            }
             t => Err(FrameError::InvalidType(t)),
         }
     }
@@ -234,8 +255,7 @@ impl Frame {
                 buf[0..M].copy_from_slice(&cw);
                 Ok(M)
             }
-            Frame::Dat(d) => Ok(d.to_bytes(buf)),
-            Frame::Fin(d) => Ok(d.to_bytes(buf)),
+            Frame::Dat(d) | Frame::DatAckReq(d) | Frame::Fin(d) => Ok(d.to_bytes(buf)),
         }
     }
 }

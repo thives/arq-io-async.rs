@@ -3,6 +3,13 @@
 //! `Arq` implements [`embedded_io_async::Read`] and
 //! [`embedded_io_async::Write`], and [`EiaLower`] adapts an
 //! `embedded_io_async` stream to the channel interface.
+//!
+//! Without the `std` feature, build instances with
+//! [`ArqLayer::build_with_timer`](crate::ArqLayer::build_with_timer) and a
+//! [`Timer`] for your platform.
+//!
+//! [`EiaLower`] requires the stream's operations to be cancel-safe; see its
+//! documentation.
 
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -11,6 +18,7 @@ use crate::Arq;
 use crate::ack_codec::AckCodec;
 use crate::crc::Crc16;
 use crate::error::ArqError;
+use crate::timer::Timer;
 use crate::transport::FrameIo;
 use crate::{Op, OpOut};
 
@@ -19,6 +27,31 @@ use crate::{Op, OpOut};
 ///
 /// The inner stream must implement both [`embedded_io_async::Read`] and
 /// [`embedded_io_async::Write`].
+///
+/// # Cancellation requirement
+///
+/// `Arq` is a polled state machine, so `EiaLower` cannot keep an `async`
+/// operation alive between polls. On every poll it creates a new `read`,
+/// `write`, or `flush` future on the inner stream, polls it once, and drops it
+/// if it returns `Pending`. The inner stream's operations must therefore be
+/// cancel-safe:
+///
+/// - Dropping a pending `read` must not lose bytes that were already received;
+///   they must be returned by a later `read`.
+/// - Dropping a pending `write` must mean nothing was written. Bytes that were
+///   accepted must be reported by a completed `write`.
+/// - Dropping a pending `flush` must leave the stream usable, so that a later
+///   `flush` can complete.
+///
+/// Streams backed by a buffer that is filled or drained in the background,
+/// such as interrupt-driven or ring-buffered UARTs, usually meet these
+/// requirements. Drivers that start a transfer inside the future and abort or
+/// lose it when the future is dropped do not, for example some DMA UART
+/// drivers. With such drivers data is lost or corrupted.
+///
+/// This adapter does not support such drivers. Supporting them would need a
+/// separate poll-based lower-layer interface that keeps the in-progress
+/// operation across polls; this crate does not currently provide one.
 pub struct EiaLower<S>(
     /// The wrapped stream.
     pub S,
@@ -52,12 +85,13 @@ where
 
 /// The error type of [`Arq`] under the `embedded_io_async` interface.
 #[allow(private_bounds)]
-impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, E>
-    embedded_io_async::ErrorType for Arq<N, M, R, Channel, Crc, AckCodecType>
+impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, Tmr, E>
+    embedded_io_async::ErrorType for Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>
 where
     Crc: Crc16,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo<Error = E>,
+    Tmr: Timer,
     E: embedded_io_async::Error,
 {
     type Error = ArqError<E>;
@@ -65,12 +99,13 @@ where
 
 /// Reads in-order data from the peer through the ARQ layer.
 #[allow(private_bounds)]
-impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, E>
-    embedded_io_async::Read for Arq<N, M, R, Channel, Crc, AckCodecType>
+impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, Tmr, E>
+    embedded_io_async::Read for Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>
 where
     Crc: Crc16,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo<Error = E>,
+    Tmr: Timer,
     E: embedded_io_async::Error,
 {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
@@ -87,12 +122,13 @@ where
 
 /// Writes data to the peer through the ARQ layer.
 #[allow(private_bounds)]
-impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, E>
-    embedded_io_async::Write for Arq<N, M, R, Channel, Crc, AckCodecType>
+impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, Tmr, E>
+    embedded_io_async::Write for Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>
 where
     Crc: Crc16,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo<Error = E>,
+    Tmr: Timer,
     E: embedded_io_async::Error,
 {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
@@ -118,20 +154,22 @@ struct ReadDrive<
     Channel,
     Crc,
     AckCodecType: AckCodec<M>,
+    Tmr,
     const N: usize,
     const M: usize,
     const R: usize,
 > {
-    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType>,
+    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>,
     buf: &'a mut [u8],
 }
 
-impl<Channel, Crc, AckCodecType, const N: usize, const M: usize, const R: usize>
-    core::future::Future for ReadDrive<'_, Channel, Crc, AckCodecType, N, M, R>
+impl<Channel, Crc, AckCodecType, Tmr, const N: usize, const M: usize, const R: usize>
+    core::future::Future for ReadDrive<'_, Channel, Crc, AckCodecType, Tmr, N, M, R>
 where
     Crc: Crc16,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo,
+    Tmr: Timer,
 {
     type Output = Result<OpOut, ArqError<Channel::Error>>;
 
@@ -151,20 +189,22 @@ struct WriteDrive<
     Channel,
     Crc,
     AckCodecType: AckCodec<M>,
+    Tmr,
     const N: usize,
     const M: usize,
     const R: usize,
 > {
-    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType>,
+    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>,
     buf: &'a [u8],
 }
 
-impl<Channel, Crc, AckCodecType, const N: usize, const M: usize, const R: usize>
-    core::future::Future for WriteDrive<'_, Channel, Crc, AckCodecType, N, M, R>
+impl<Channel, Crc, AckCodecType, Tmr, const N: usize, const M: usize, const R: usize>
+    core::future::Future for WriteDrive<'_, Channel, Crc, AckCodecType, Tmr, N, M, R>
 where
     Crc: Crc16,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo,
+    Tmr: Timer,
 {
     type Output = Result<OpOut, ArqError<Channel::Error>>;
 
@@ -184,19 +224,21 @@ struct FlushDrive<
     Channel,
     Crc,
     AckCodecType: AckCodec<M>,
+    Tmr,
     const N: usize,
     const M: usize,
     const R: usize,
 > {
-    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType>,
+    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>,
 }
 
-impl<Channel, Crc, AckCodecType, const N: usize, const M: usize, const R: usize>
-    core::future::Future for FlushDrive<'_, Channel, Crc, AckCodecType, N, M, R>
+impl<Channel, Crc, AckCodecType, Tmr, const N: usize, const M: usize, const R: usize>
+    core::future::Future for FlushDrive<'_, Channel, Crc, AckCodecType, Tmr, N, M, R>
 where
     Crc: Crc16,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo,
+    Tmr: Timer,
 {
     type Output = Result<OpOut, ArqError<Channel::Error>>;
 

@@ -8,7 +8,12 @@ use core::fmt;
 pub enum ArqError<E> {
     /// An I/O error from the underlying channel.
     Io(E),
-    /// A frame failed validation; see [`FrameError`].
+    /// Received data could not be split into frames and the stream cannot be
+    /// resynchronized, e.g. an unknown frame type or an impossible length;
+    /// see [`FrameError`].
+    ///
+    /// Complete frames that only fail their CRC check are discarded and
+    /// recovered by retransmission instead of being reported.
     Framing(FrameError),
     /// An ACK frame could not be decoded; see [`AckError`].
     InvalidAck(AckError),

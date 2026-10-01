@@ -7,6 +7,7 @@ use crate::Arq;
 use crate::ack_codec::AckCodec;
 use crate::crc::Crc16;
 use crate::error::ArqError;
+use crate::timer::Timer;
 use crate::transport::FrameIo;
 use crate::{Op, OpOut};
 
@@ -42,12 +43,13 @@ where
 }
 
 /// Reads in-order data from the peer through the ARQ layer.
-impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType> AsyncRead
-    for Arq<N, M, R, Channel, Crc, AckCodecType>
+impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, Tmr> AsyncRead
+    for Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>
 where
     Crc: Crc16 + Unpin,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo + Unpin,
+    Tmr: Timer + Unpin,
     ArqError<Channel::Error>: core::error::Error + Send + Sync + 'static,
 {
     fn poll_read(
@@ -76,12 +78,13 @@ where
 
 /// Writes data to the peer through the ARQ layer. `poll_shutdown` closes the
 /// link towards the peer.
-impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType> AsyncWrite
-    for Arq<N, M, R, Channel, Crc, AckCodecType>
+impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, Tmr> AsyncWrite
+    for Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>
 where
     Crc: Crc16 + Unpin,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo + Unpin,
+    Tmr: Timer + Unpin,
     ArqError<Channel::Error>: core::error::Error + Send + Sync + 'static,
 {
     fn poll_write(

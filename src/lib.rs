@@ -42,6 +42,41 @@
 //! `16` is the codeword length of the default ACK codec, and `r::<8>()` is the
 //! minimum read buffer size for a window of `8`.
 //!
+//! ## Retransmission timer
+//!
+//! Unacknowledged frames are retransmitted when a retransmission timeout
+//! expires, never merely because the layer is polled. The timeout starts at
+//! 250 ms, doubles on every expiry without progress up to 4 s, and returns to
+//! its initial value whenever an ACK acknowledges new data. Change the bounds
+//! with [`ArqLayer::with_retransmit_timeout`].
+//!
+//! The time source is supplied through the [`Timer`] trait:
+//!
+//! - With the `std` feature (enabled by `tokio`), `ArqLayer::build` uses
+//!   `StdTimer`, which works with any executor.
+//! - Without `std`, implement [`Timer`] for your platform and use
+//!   [`ArqLayer::build_with_timer`].
+//!
+//! ## Flushing
+//!
+//! `flush` completes once every written byte has been acknowledged by the peer.
+//! The last data frame of the flushed burst asks the peer to acknowledge it
+//! immediately, so a short write followed by `flush` does not wait for more
+//! traffic. Ordinary writes are still acknowledged in batches. `flush` does not
+//! close the link and can be called any number of times.
+//!
+//! ## Corrupt and lost frames
+//!
+//! A complete frame that fails its CRC check is discarded and recovered by
+//! retransmission. Lost or corrupt ACKs are recovered the same way: the
+//! retransmitted frame is a duplicate, and the peer answers duplicates with a
+//! fresh ACK.
+//!
+//! The channel is treated as a plain byte stream, so the length field in the
+//! frame header is the only frame boundary. Input with an unknown frame type or
+//! an impossible length cannot be resynchronized and fails the link with
+//! [`ArqError::Framing`].
+//!
 //! ## Closing the link
 //!
 //! `AsyncWrite::shutdown` flushes any pending data in a final `FIN` frame and
@@ -58,6 +93,7 @@ mod crc;
 pub mod embedded_io;
 mod error;
 mod frame;
+mod timer;
 #[cfg(feature = "tokio")]
 mod tokio;
 mod transport;
@@ -68,20 +104,27 @@ mod tests;
 use ::futures::task::AtomicWaker;
 use core::marker::PhantomData;
 use core::task::{Context, Poll};
+use core::time::Duration;
 
 pub use crate::ack_codec::{AckCodec, BchAckCodec};
 pub use crate::crc::Crc16;
 pub use crate::error::{AckError, ArqError, FrameError};
 pub use crate::frame::{AckFrame, MAX_SEQ};
+#[cfg(feature = "std")]
+pub use crate::timer::StdTimer;
+pub use crate::timer::Timer;
 
 use crate::frame::{DatFrame, Frame, MAX_PAYLOAD};
 use crate::transport::FrameIo;
 
 pub(crate) const MAX_FRAME: usize = 256;
 
+const DEFAULT_RTO_INITIAL: Duration = Duration::from_millis(250);
+const DEFAULT_RTO_MAX: Duration = Duration::from_secs(4);
+
 /// Minimum size, in bytes, of the read buffer for a retransmission window of `N`.
 ///
-/// [`ArqLayer::build`] requires `R >= r::<N>()`.
+/// [`ArqLayer::build_with_timer`] requires `R >= r::<N>()`.
 pub const fn r<const N: usize>() -> usize {
     2 * N * MAX_PAYLOAD
 }
@@ -165,7 +208,8 @@ impl<const N: usize> Ring<N> {
 /// `Arq` has no methods of its own; drive it through
 /// `tokio::io::AsyncRead` / `tokio::io::AsyncWrite` (feature `tokio`) or
 /// `embedded_io_async::Read` / `embedded_io_async::Write` (feature
-/// `embedded-io`). Construct instances with [`ArqLayer::build`].
+/// `embedded-io`). Construct instances with [`ArqLayer::build_with_timer`], or
+/// with `ArqLayer::build` when the `std` feature is enabled.
 ///
 /// Parameters:
 ///
@@ -178,20 +222,26 @@ impl<const N: usize> Ring<N> {
 ///   `embedded-io`, wrap the stream in `embedded_io::EiaLower`.
 /// - `Crc`: the [`Crc16`] algorithm used to protect frames.
 /// - `AckCodecType`: the [`AckCodec`] used to protect ACK frames.
+/// - `Tmr`: the [`Timer`] that schedules retransmissions.
 ///
 /// Reading returns `Ok(0)` when the peer has closed its stream and the buffer
 /// is drained. Writing after the link is closed fails with [`ArqError::Closed`].
 #[derive(Debug)]
-pub struct Arq<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType>
+pub struct Arq<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, Tmr>
 where
     AckCodecType: AckCodec<M>,
 {
     channel: Channel,
     crc: Crc,
+    timer: Tmr,
+    timer_running: bool,
+    rto: Duration,
+    rto_initial: Duration,
+    rto_max: Duration,
+    retx: usize,
     state: State,
     sb: u16,
     w: usize,
-    g: usize,
     r: u16,
     sbuf: Ring<N>,
     fin_armed: bool,
@@ -216,19 +266,24 @@ where
     p_ack_codec: PhantomData<fn() -> AckCodecType>,
 }
 
-impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType>
-    Arq<N, M, R, Channel, Crc, AckCodecType>
+impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, Tmr>
+    Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>
 where
     AckCodecType: AckCodec<M>,
 {
-    fn new(channel: Channel, crc: Crc) -> Self {
+    fn new(channel: Channel, crc: Crc, timer: Tmr) -> Self {
         Self {
             channel,
             crc,
+            timer,
+            timer_running: false,
+            rto: DEFAULT_RTO_INITIAL,
+            rto_initial: DEFAULT_RTO_INITIAL,
+            rto_max: DEFAULT_RTO_MAX,
+            retx: 0,
             state: State::Active,
             sb: 0,
             w: 0,
-            g: 0,
             r: 0,
             sbuf: Ring::new(),
             fin_armed: false,
@@ -259,12 +314,13 @@ where
 }
 
 #[allow(private_bounds)]
-impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType>
-    Arq<N, M, R, Channel, Crc, AckCodecType>
+impl<const N: usize, const M: usize, const R: usize, Channel, Crc, AckCodecType, Tmr>
+    Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>
 where
     Crc: Crc16,
     AckCodecType: AckCodec<M>,
     Channel: FrameIo,
+    Tmr: Timer,
 {
     pub(crate) fn poll_op(
         &mut self,
@@ -326,6 +382,7 @@ where
             }
         }
 
+        self.poll_timer(cx);
         match self.pick_next(tx) {
             Err(e) => return Poll::Ready(Err(e)),
             Ok(false) if self.outgoing.is_some() => match self.send_one(cx) {
@@ -371,6 +428,7 @@ where
                 Poll::Ready(Ok(frame)) => self.on_frame(frame),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
+            self.poll_timer(cx);
             match self.pick_next(tx) {
                 Err(e) => return Poll::Ready(Err(e)),
                 Ok(true) => match self.send_one(cx) {
@@ -416,6 +474,7 @@ where
             if self.tx_done {
                 return self.flush_channel(cx);
             }
+            self.poll_timer(cx);
             match self.pick_next(TxPolicy::Flush) {
                 Err(e) => return Poll::Ready(Err(e)),
                 Ok(true) => match self.send_one(cx) {
@@ -464,14 +523,24 @@ where
             match Frame::wire_len::<AckCodecType, M, _>(&self.crc, &self.rx_pending[..self.rx_len])
             {
                 Err(FrameError::TooShort(_)) => {}
+                Err(_) if self.rx_len < M => {}
                 Err(e) => return Poll::Ready(Err(ArqError::Framing(e))),
                 Ok(len) if self.rx_len >= len => {
-                    let frame =
-                        Frame::from_bytes::<AckCodecType, M, _>(&self.crc, &self.rx_pending[..len])
-                            .map_err(ArqError::Framing)?;
-                    self.rx_pending.copy_within(len..self.rx_len, 0);
-                    self.rx_len -= len;
-                    return Poll::Ready(Ok(frame));
+                    match Frame::from_bytes::<AckCodecType, M, _>(
+                        &self.crc,
+                        &self.rx_pending[..len],
+                    ) {
+                        Err(_) if self.rx_len < M => {}
+                        res => {
+                            self.rx_pending.copy_within(len..self.rx_len, 0);
+                            self.rx_len -= len;
+                            match res {
+                                Ok(frame) => return Poll::Ready(Ok(frame)),
+                                Err(FrameError::CrcMismatch(..)) => continue,
+                                Err(e) => return Poll::Ready(Err(ArqError::Framing(e))),
+                            }
+                        }
+                    }
                 }
                 Ok(_) if self.rx_len >= MAX_FRAME => {
                     return Poll::Ready(Err(ArqError::Framing(FrameError::TooLong(MAX_FRAME))));
@@ -498,43 +567,93 @@ where
             let ack = AckFrame::new(&self.crc, an)?;
             return self.arm_outgoing(&Frame::Ack(ack)).map(|_| true);
         }
-        if tx != TxPolicy::Acks && self.fin_armed && !self.fin_sent && self.w < N {
+        if tx == TxPolicy::Acks {
+            return Ok(false);
+        }
+        if self.retx > 0 {
+            let Some(f) = self.sbuf.get(self.r) else {
+                debug_assert!(false, "retransmit slot empty");
+                self.retx = 0;
+                return Ok(false);
+            };
+            self.r = (self.r + 1) % MAX_SEQ;
+            self.retx -= 1;
+            if self.retx == 0 {
+                self.restart_timer();
+            }
+            return self.arm_outgoing(&Frame::from_dat(f)).map(|_| true);
+        }
+        if self.fin_armed && !self.fin_sent && self.w < N {
             let sn = (self.sb + self.w as u16) % MAX_SEQ;
             let fin = DatFrame::new_fin(&self.crc, sn, &self.pending.buf[..self.pending.len]);
             self.sbuf.set(sn, fin);
             self.fin_sent = true;
             self.pending.len = 0;
             self.w += 1;
-            self.g += 1;
+            self.arm_timer();
             return self.arm_outgoing(&Frame::Fin(fin)).map(|_| true);
         }
-        if tx != TxPolicy::Acks && self.w < N && self.pending.len > 0 {
+        if self.w < N && self.pending.len > 0 {
             let sn = (self.sb + self.w as u16) % MAX_SEQ;
-            let dat = DatFrame::new_dat(&self.crc, sn, &self.pending.buf[..self.pending.len]);
+            let payload = &self.pending.buf[..self.pending.len];
+            let dat = if tx == TxPolicy::Flush {
+                DatFrame::new_dat_ack_req(&self.crc, sn, payload)
+            } else {
+                DatFrame::new_dat(&self.crc, sn, payload)
+            };
             self.sbuf.set(sn, dat);
             self.pending.len = 0;
             self.w += 1;
-            self.g += 1;
-            return self.arm_outgoing(&Frame::Dat(dat)).map(|_| true);
+            self.arm_timer();
+            return self.arm_outgoing(&Frame::from_dat(dat)).map(|_| true);
         }
-        if tx == TxPolicy::Full && self.w > 0 && self.g >= self.w {
-            if dist(self.sb, self.r) >= self.w as u16 {
-                self.r = self.sb;
+        if tx == TxPolicy::Flush
+            && self.w > 0
+            && self.pending.len == 0
+            && !(self.fin_armed && !self.fin_sent)
+        {
+            let last = (self.sb + self.w as u16 - 1) % MAX_SEQ;
+            match self.sbuf.get(last) {
+                Some(f) if !f.is_fin() && !f.requests_ack() => {
+                    let f = f.to_ack_req(&self.crc);
+                    self.sbuf.set(last, f);
+                    return self.arm_outgoing(&Frame::DatAckReq(f)).map(|_| true);
+                }
+                _ => {}
             }
-            let Some(f) = self.sbuf.get(self.r) else {
-                debug_assert!(false, "retransmit slot empty");
-                return Ok(false);
-            };
-            self.r = (self.r + 1) % MAX_SEQ;
-            self.g += 1;
-            let frame = if f.is_fin() {
-                Frame::Fin(f)
-            } else {
-                Frame::Dat(f)
-            };
-            return self.arm_outgoing(&frame).map(|_| true);
         }
         Ok(false)
+    }
+
+    fn arm_timer(&mut self) {
+        if !self.timer_running {
+            self.restart_timer();
+        }
+    }
+
+    fn restart_timer(&mut self) {
+        self.timer.start(self.rto);
+        self.timer_running = true;
+    }
+
+    fn stop_timer(&mut self) {
+        if self.timer_running {
+            self.timer.stop();
+            self.timer_running = false;
+        }
+    }
+
+    fn poll_timer(&mut self, cx: &mut Context<'_>) {
+        if !self.timer_running || self.w == 0 {
+            return;
+        }
+        if self.timer.poll_expired(cx).is_pending() {
+            return;
+        }
+        self.timer_running = false;
+        self.r = self.sb;
+        self.retx = self.w;
+        self.rto = self.rto.saturating_mul(2).min(self.rto_max);
     }
 
     fn arm_outgoing(&mut self, frame: &Frame) -> Result<(), ArqError<Channel::Error>> {
@@ -577,8 +696,7 @@ where
     fn on_frame(&mut self, frame: Frame) {
         match frame {
             Frame::Ack(ack) => self.on_ack(ack.an()),
-            Frame::Dat(d) => self.on_dat(d),
-            Frame::Fin(d) => self.on_dat(d),
+            Frame::Dat(d) | Frame::DatAckReq(d) | Frame::Fin(d) => self.on_dat(d),
         }
     }
 
@@ -586,6 +704,10 @@ where
         let d = dist(self.sb, an);
         if d == 0 || d as usize > self.w {
             return;
+        }
+        if self.retx > 0 && dist(self.sb, self.r) < d {
+            self.retx -= (dist(self.r, an) as usize).min(self.retx);
+            self.r = an;
         }
         for _ in 0..d as usize {
             if let Some(f) = self.sbuf.take(self.sb) {
@@ -596,19 +718,27 @@ where
             self.sb = (self.sb + 1) % MAX_SEQ;
             self.w -= 1;
         }
-        self.g = 0;
-        self.r = self.sb;
+        self.rto = self.rto_initial;
+        if self.w == 0 {
+            self.stop_timer();
+        } else if self.retx == 0 {
+            self.restart_timer();
+        }
         self.tx_done = self.w == 0 && self.fin_acked;
         if self.w < N {
             self.write_waker.wake();
         }
     }
 
+    fn schedule_ack(&mut self) {
+        self.ack_pending = Some(self.rn);
+        self.acount = 0;
+    }
+
     fn on_dat(&mut self, f: DatFrame) {
         let is_fin = f.is_fin();
         if self.rx_finished {
-            self.ack_pending = Some(self.rn);
-            self.acount = 0;
+            self.schedule_ack();
             return;
         }
         let sn = f.sn();
@@ -622,8 +752,7 @@ where
             self.read_waker.wake();
             if is_fin {
                 self.rx_finished = true;
-                self.ack_pending = Some(self.rn);
-                self.acount = 0;
+                self.schedule_ack();
                 return;
             }
             let mut drained = false;
@@ -644,12 +773,21 @@ where
                     break;
                 }
             }
-            if self.rx_finished || drained || self.acount >= N {
-                self.ack_pending = Some(self.rn);
-                self.acount = 0;
+            if self.rx_finished || drained || self.acount >= N || f.requests_ack() {
+                self.schedule_ack();
             }
-        } else if (d as usize) < N && self.rbuf.get(sn).is_none() {
-            self.rbuf.set(sn, f);
+        } else if (d as usize) < N {
+            match self.rbuf.get(sn) {
+                Some(b) if b.sn() == sn => self.schedule_ack(),
+                _ => {
+                    self.rbuf.set(sn, f);
+                    if f.requests_ack() {
+                        self.schedule_ack();
+                    }
+                }
+            }
+        } else if dist(sn, self.rn) as usize <= N {
+            self.schedule_ack();
         }
     }
 
@@ -723,6 +861,8 @@ where
     Crc: Clone,
 {
     crc: Crc,
+    rto_initial: Duration,
+    rto_max: Duration,
     p_ack_codec: PhantomData<fn() -> AckCodecType>,
 }
 
@@ -736,6 +876,8 @@ impl<const N: usize> ArqLayer<N, ::crc::Crc<u16>, BchAckCodec> {
         assert!(N.is_multiple_of(2), "N must be even");
         ArqLayer {
             crc: ::crc::Crc::<u16>::new(&::crc::CRC_16_IBM_SDLC),
+            rto_initial: DEFAULT_RTO_INITIAL,
+            rto_max: DEFAULT_RTO_MAX,
             p_ack_codec: PhantomData,
         }
     }
@@ -754,11 +896,13 @@ where
 {
     /// Replaces the ACK codec type with `AckCodecType`.
     ///
-    /// `M`, the codeword length, is chosen at [`ArqLayer::build`] and must
-    /// match the codec.
+    /// `M`, the codeword length, is chosen at [`ArqLayer::build_with_timer`]
+    /// and must match the codec.
     pub fn with_ack_codec_type<AckCodecType>(self) -> ArqLayer<N, Crc, AckCodecType> {
         ArqLayer {
             crc: self.crc,
+            rto_initial: self.rto_initial,
+            rto_max: self.rto_max,
             p_ack_codec: PhantomData,
         }
     }
@@ -775,8 +919,32 @@ where
     {
         ArqLayer {
             crc,
+            rto_initial: self.rto_initial,
+            rto_max: self.rto_max,
             p_ack_codec: PhantomData,
         }
+    }
+
+    /// Sets the retransmission timeout bounds.
+    ///
+    /// Unacknowledged frames are retransmitted `initial` after they are sent.
+    /// Each further expiry without an acknowledgement doubles the timeout, up
+    /// to `max`, and an acknowledgement of new data resets it to `initial`.
+    /// Defaults to 250 ms and 4 s.
+    ///
+    /// Choose `initial` above the link's round-trip time for a full window of
+    /// frames; a shorter timeout causes needless retransmissions.
+    ///
+    /// Panics if `initial` is zero or `max < initial`.
+    pub fn with_retransmit_timeout(mut self, initial: Duration, max: Duration) -> Self {
+        assert!(
+            !initial.is_zero(),
+            "initial retransmit timeout must be non-zero"
+        );
+        assert!(max >= initial, "max retransmit timeout must be >= initial");
+        self.rto_initial = initial;
+        self.rto_max = max;
+        self
     }
 }
 
@@ -784,18 +952,45 @@ impl<const N: usize, Crc, AckCodecType> ArqLayer<N, Crc, AckCodecType>
 where
     Crc: Crc16 + Clone,
 {
-    /// Builds an [`Arq`] over `channel`.
+    /// Builds an [`Arq`] over `channel`, using a [`StdTimer`] for
+    /// retransmissions.
     ///
     /// `M` must be the codeword length of `AckCodecType`, and `R` must be at
-    /// least `r::<N>()`.
+    /// least `r::<N>()`. Requires the `std` feature; otherwise use
+    /// [`ArqLayer::build_with_timer`].
+    ///
+    /// Panics if `R < r::<N>()`.
+    #[cfg(feature = "std")]
     pub fn build<const M: usize, const R: usize, Channel>(
         &self,
         channel: Channel,
-    ) -> Arq<N, M, R, Channel, Crc, AckCodecType>
+    ) -> Arq<N, M, R, Channel, Crc, AckCodecType, StdTimer>
     where
         AckCodecType: AckCodec<M>,
     {
+        self.build_with_timer(channel, StdTimer::new())
+    }
+
+    /// Builds an [`Arq`] over `channel`, using `timer` for retransmissions.
+    ///
+    /// `M` must be the codeword length of `AckCodecType`, and `R` must be at
+    /// least `r::<N>()`. Each instance needs its own timer.
+    ///
+    /// Panics if `R < r::<N>()`.
+    pub fn build_with_timer<const M: usize, const R: usize, Channel, Tmr>(
+        &self,
+        channel: Channel,
+        timer: Tmr,
+    ) -> Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>
+    where
+        AckCodecType: AckCodec<M>,
+        Tmr: Timer,
+    {
         assert!(R >= r::<N>());
-        Arq::new(channel, self.crc.clone())
+        let mut arq = Arq::new(channel, self.crc.clone(), timer);
+        arq.rto = self.rto_initial;
+        arq.rto_initial = self.rto_initial;
+        arq.rto_max = self.rto_max;
+        arq
     }
 }
