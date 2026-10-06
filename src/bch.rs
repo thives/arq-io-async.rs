@@ -2,6 +2,7 @@ const NUM_COEFFS: usize = 24;
 const NUM_SYNDROMES: usize = 22;
 const FIELD_SIZE: usize = 63;
 
+/// Encodes a 16-bit word into a 64-bit BCH codeword.
 pub fn encode(word: u16) -> u64 {
     GEN.iter().fold(word as u64, |accum, &row| {
         let bit = ((word & row).count_ones() & 1) as u8;
@@ -9,6 +10,13 @@ pub fn encode(word: u16) -> u64 {
     })
 }
 
+/// Decodes a 64-bit codeword into the word and the number of bit errors that
+/// were corrected, or `None` if the errors cannot be corrected.
+///
+/// Bit 0 of the codeword is not part of the protected word. Beyond the
+/// guaranteed correction radius a decode can succeed with a wrong or an
+/// excessive correction count; callers enforce their own limit, as the ACK
+/// codec does.
 pub fn decode(bits: u64) -> Option<(u16, usize)> {
     let word = bits >> 1;
     Errors::new(syndromes(word)).map(|(nerr, errs)| {
@@ -87,7 +95,7 @@ const POWERS: [usize; FIELD_SIZE] = [
     30, 50, 22, 39, 43, 29, 60, 42, 21, 20, 59, 57, 58,
 ];
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 struct Codeword {
     bits: u8,
 }
@@ -121,8 +129,7 @@ impl Codeword {
     }
 }
 
-#[derive(Default, Copy, Clone)]
-struct BchCoefs([Codeword; NUM_COEFFS]);
+type BchCoefs = [Codeword; NUM_COEFFS];
 
 #[allow(clippy::suspicious_arithmetic_impl)]
 impl core::ops::Add for Codeword {
@@ -157,25 +164,6 @@ impl core::ops::Div for Codeword {
     }
 }
 
-impl Default for Codeword {
-    fn default() -> Self {
-        Codeword::new(0)
-    }
-}
-
-impl core::ops::Deref for BchCoefs {
-    type Target = [Codeword];
-    fn deref(&self) -> &Self::Target {
-        &self.0[..]
-    }
-}
-
-impl core::ops::DerefMut for BchCoefs {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0[..]
-    }
-}
-
 fn syndromes(word: u64) -> Polynomial {
     Polynomial::new((1..=NUM_SYNDROMES).map(|p| {
         (0..63).fold(Codeword::default(), |s, b| {
@@ -199,7 +187,11 @@ impl Errors {
         let loc = ErrorLocator::new(syn).build();
         let errors = loc.degree().expect("invalid error polynomial");
         let mut roots = Polynomial::default();
-        let nroots = PolynomialRoots::new(loc).collect_slice(&mut roots[..]);
+        let mut nroots = 0;
+        for (dest, root) in roots.iter_mut().zip(PolynomialRoots::new(loc)) {
+            *dest = root;
+            nroots += 1;
+        }
         if nroots != errors {
             return None;
         }
@@ -250,17 +242,14 @@ struct Polynomial {
 }
 
 impl Polynomial {
-    fn new<T: Iterator<Item = Codeword>>(mut init: T) -> Self {
+    fn new<T: Iterator<Item = Codeword>>(init: T) -> Self {
         let mut coefs = BchCoefs::default();
-        init.collect_slice(&mut coefs[..]);
+        coefs.iter_mut().zip(init).for_each(|(d, c)| *d = c);
         Polynomial { coefs, start: 0 }
     }
 
     fn get(&self, idx: usize) -> Codeword {
-        match self.coefs.get(idx) {
-            Some(&c) => c,
-            None => Codeword::default(),
-        }
+        self.coefs.get(idx).copied().unwrap_or_default()
     }
 
     fn shift(mut self) -> Polynomial {
@@ -281,12 +270,8 @@ impl Polynomial {
     }
 
     fn degree(&self) -> Option<usize> {
-        for (deg, coef) in self.coefs.iter().enumerate().rev() {
-            if !coef.zero() {
-                return Some(deg - self.start);
-            }
-        }
-        None
+        let deg = self.coefs.iter().rposition(|c| !c.zero())?;
+        Some(deg - self.start)
     }
 
     fn coef(&self, i: usize) -> Codeword {
@@ -474,22 +459,6 @@ impl core::ops::Mul<Codeword> for Polynomial {
     }
 }
 
-trait CollectSlice: Iterator {
-    fn collect_slice(&mut self, slice: &mut [Self::Item]) -> usize;
-}
-
-impl<I: ?Sized> CollectSlice for I
-where
-    I: Iterator,
-{
-    fn collect_slice(&mut self, slice: &mut [Self::Item]) -> usize {
-        slice.iter_mut().zip(self).fold(0, |count, (dest, item)| {
-            *dest = item;
-            count + 1
-        })
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::syndromes;
@@ -531,10 +500,6 @@ mod test {
         );
         assert!(
             decode(encode(0b0000000000000000) ^ 0b11111111111).unwrap() == (0b0000000000000000, 10)
-        );
-        assert!(
-            decode(encode(0b0000111110000000) ^ 0b111111111110).unwrap()
-                == (0b0000111110000000, 11)
         );
         assert!(
             decode(encode(0b0000111110000000) ^ 0b111111111110).unwrap()

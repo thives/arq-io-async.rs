@@ -10,10 +10,11 @@
 //!
 //! - `tokio::io::AsyncRead` / `tokio::io::AsyncWrite`, enabled by the `tokio`
 //!   feature (default). Any `AsyncRead + AsyncWrite + Unpin` stream can be used
-//!   as the channel.
+//!   as the channel. Errors are returned as `std::io::Error` whose kind
+//!   reflects the cause and whose payload is the original [`ArqError`].
 //! - `embedded_io_async::Read` / `embedded_io_async::Write`, enabled by the
-//!   `embedded-io` feature. Use `embedded_io::EiaLower` to adapt your stream to
-//!   the channel interface.
+//!   `embedded-io` feature. Implement `embedded_io::PollTransport` for your
+//!   stream and wrap it in `embedded_io::EiaPoll` to use it as the channel.
 //!
 //! One instance is one link: the peer must run its own instance on the other
 //! end of the channel.
@@ -24,6 +25,8 @@
 //! window `N` and carries the CRC algorithm and ACK codec:
 //!
 //! ```no_run
+//! # #[cfg(feature = "tokio")]
+//! # {
 //! use arq_io_async::{ArqLayer, r};
 //! use tokio::io::{AsyncReadExt, AsyncWriteExt};
 //!
@@ -37,6 +40,7 @@
 //!     let mut buf = [0u8; 5];
 //!     arq.read_exact(&mut buf).await
 //! };
+//! # }
 //! ```
 //!
 //! `16` is the codeword length of the default ACK codec, and `r::<8>()` is the
@@ -59,7 +63,9 @@
 //!
 //! ## Flushing
 //!
-//! `flush` completes once every written byte has been acknowledged by the peer.
+//! `flush` completes once every written byte has been acknowledged by the peer
+//! and every ACK the layer owes the peer has been written and flushed on the
+//! lower channel.
 //! The last data frame of the flushed burst asks the peer to acknowledge it
 //! immediately, so a short write followed by `flush` does not wait for more
 //! traffic. Ordinary writes are still acknowledged in batches. `flush` does not
@@ -67,15 +73,20 @@
 //!
 //! ## Corrupt and lost frames
 //!
-//! A complete frame that fails its CRC check is discarded and recovered by
-//! retransmission. Lost or corrupt ACKs are recovered the same way: the
-//! retransmitted frame is a duplicate, and the peer answers duplicates with a
-//! fresh ACK.
-//!
 //! The channel is treated as a plain byte stream, so the length field in the
-//! frame header is the only frame boundary. Input with an unknown frame type or
-//! an impossible length cannot be resynchronized and fails the link with
-//! [`ArqError::Framing`].
+//! frame header is the only frame boundary. Input with an unknown frame type,
+//! an impossible length, or a complete frame that fails validation (such as a
+//! bad CRC) cannot be resynchronized, because its length cannot be trusted, and
+//! fails the link with [`ArqError::Framing`]. With `embedded-io`, use
+//! `embedded_io::EiaFramed` over a `embedded_io::ReadFrame` transport to
+//! preserve authoritative boundaries instead. There an invalid frame is
+//! discarded without retaining bytes or consuming any part of the next frame,
+//! and it is recovered by retransmission.
+//!
+//! Lost or corrupt ACKs over a framing transport are recovered the same way,
+//! and so are lost ACKs on any channel: the retransmitted frame is a duplicate,
+//! and the peer answers duplicates with a fresh ACK. This includes a duplicate
+//! `FIN` received after the stream has completed; see "Closing the link".
 //!
 //! ## Closing the link
 //!
@@ -83,8 +94,42 @@
 //! signals end-of-stream to the peer. Afterwards `write` fails with
 //! [`ArqError::Closed`], and the peer's `read` returns `0` bytes once its
 //! stream is drained.
+//!
+//! The reader sees end-of-stream only after the layer has sent and flushed the
+//! ACK for the peer's `FIN`. `shutdown` likewise completes only after the ACK
+//! for a received `FIN` has been delivered.
+//!
+//! Completion means that application data transfer is finished, not that the
+//! layer can no longer receive. If the ACK for a `FIN` is lost, the peer
+//! retransmits the `FIN`, and the completed layer acknowledges the duplicate
+//! whenever it is polled. It never sends new data or reopens writing, and no
+//! fixed linger time is used, because no finite delay can prove that the peer
+//! received the last ACK.
+//!
+//! Recovery therefore works only while the instance keeps being polled. Once
+//! polling stops or the instance is dropped, a lost final ACK cannot be
+//! recovered.
+//!
+//! ## Lower end-of-stream
+//!
+//! If the lower channel's read side ends, frames already received are still
+//! delivered. `read` returns the accepted data first, then `0` bytes if a
+//! valid `FIN` was received, otherwise [`ArqError::Closed`]. Writing is not
+//! disabled, but `flush` and `shutdown` fail with [`ArqError::Closed`] once
+//! they would have to wait for an ACK that can no longer arrive.
+//!
+//! ## Work per poll
+//!
+//! Each poll processes a bounded amount of received input, including corrupt
+//! frames, and then services transmission. When input remains, the polled task
+//! is woken so processing continues in a later poll. This also holds after the
+//! stream has completed, where received frames are still processed to
+//! acknowledge duplicates.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(test)]
+extern crate std;
 
 mod ack_codec;
 mod bch;
@@ -103,8 +148,10 @@ mod tests;
 
 use ::futures::task::AtomicWaker;
 use core::marker::PhantomData;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 pub use crate::ack_codec::{AckCodec, BchAckCodec};
 pub use crate::crc::Crc16;
@@ -117,10 +164,17 @@ pub use crate::timer::Timer;
 use crate::frame::{DatFrame, Frame, MAX_PAYLOAD};
 use crate::transport::FrameIo;
 
-pub(crate) const MAX_FRAME: usize = 256;
+/// Maximum wire-frame length, including the header.
+pub const MAX_FRAME: usize = 256;
 
 const DEFAULT_RTO_INITIAL: Duration = Duration::from_millis(250);
 const DEFAULT_RTO_MAX: Duration = Duration::from_secs(4);
+
+/// Work units (lower reads and decoded or discarded frames) one receive batch
+/// may spend before yielding.
+const RX_BUDGET: usize = 32;
+/// Receive/transmit rounds a flush or shutdown poll may run before yielding.
+const MAX_ROUNDS: usize = 32;
 
 /// Minimum size, in bytes, of the read buffer for a retransmission window of `N`.
 ///
@@ -133,20 +187,62 @@ fn dist(a: u16, b: u16) -> u16 {
     b.wrapping_sub(a) & (MAX_SEQ - 1)
 }
 
+/// Progress of the stream, derived by `transition` from `tx_done` and
+/// `rx_complete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
+    /// Neither direction has finished.
     Active,
+    /// Our `FIN` and all data before it were acknowledged.
     SendDone,
+    /// The peer's `FIN` was received, its data drained and its ACK flushed.
     RecvDone,
+    /// Both directions finished. Only ACKs for duplicate frames are still
+    /// serviced, by `poll_completed`.
     Done,
 }
 
+/// What `service_tx` may send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxPolicy {
+    /// Only ACKs.
     Acks,
+    /// ACKs, retransmissions and data, requesting an ACK for the last frame.
     Flush,
+    /// ACKs, retransmissions and data.
     Full,
 }
+
+/// Wakers of the operations waiting on the engine.
+///
+/// With `std`, the lower channel and the timer are given one stable waker that
+/// wakes both of these, so readiness reaches a task that can drive the
+/// engine whichever operation polled it last. Without `std` there is no
+/// allocation to hold a shared wake object, and the lower I/O gets the
+/// caller's waker: `embedded_io_async` operations borrow the instance mutably,
+/// so only one operation is ever waiting.
+#[derive(Debug, Default)]
+struct Wakers {
+    read: AtomicWaker,
+    write: AtomicWaker,
+}
+
+#[cfg(feature = "std")]
+impl std::task::Wake for Wakers {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.read.wake();
+        self.write.wake();
+    }
+}
+
+#[cfg(feature = "std")]
+type SharedWakers = Arc<Wakers>;
+#[cfg(not(feature = "std"))]
+type SharedWakers = Wakers;
 
 pub(crate) enum Op<'a> {
     Read {
@@ -167,11 +263,40 @@ pub(crate) enum OpOut {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutgoingKind {
+    Ack,
+    Data,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Outgoing {
+    kind: OutgoingKind,
     buf: [u8; MAX_FRAME],
     off: usize,
     total: usize,
+    /// All bytes were accepted by the channel; the channel flush is pending.
+    flushing: bool,
+    /// Arm the retransmission timer once the frame is flushed.
+    arm_timer: bool,
+}
+
+/// The outcome of one attempt to take a frame from the lower channel.
+#[allow(clippy::large_enum_variant)]
+enum Recv {
+    Frame(Frame),
+    /// No complete frame is available; the lower read registered its waker.
+    Pending,
+    /// The lower read side ended and every buffered frame was consumed.
+    Eof,
+    /// The work budget ran out; more input may be buffered.
+    Budget,
+}
+
+struct RecvBatch {
+    frames: usize,
+    /// The batch stopped on its budget rather than on an idle input.
+    more: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,26 +305,61 @@ struct Pending {
     len: usize,
 }
 
+/// The frames of a window of `N` sequence numbers starting at `base`.
+///
+/// Slots are addressed by distance from `base`, so the mapping holds across
+/// sequence-number wrap for any `N`.
 #[derive(Debug, Clone, Copy)]
 struct Ring<const N: usize> {
     slots: [Option<DatFrame>; N],
+    base: u16,
+    head: usize,
 }
 
 impl<const N: usize> Ring<N> {
     fn new() -> Self {
-        Self { slots: [None; N] }
+        Self {
+            slots: [None; N],
+            base: 0,
+            head: 0,
+        }
+    }
+
+    fn slot(&self, sn: u16) -> Option<usize> {
+        let off = dist(self.base, sn) as usize;
+        (off < N).then_some((self.head + off) % N)
     }
 
     fn get(&self, sn: u16) -> Option<DatFrame> {
-        self.slots[(sn as usize) % N]
+        let f = self.slots[self.slot(sn)?]?;
+        debug_assert_eq!(f.sn(), sn);
+        Some(f)
     }
 
-    fn set(&mut self, sn: u16, f: DatFrame) {
-        self.slots[(sn as usize) % N] = Some(f);
+    /// Stores `f` in its slot, unless the slot is outside the window or holds
+    /// another frame.
+    fn insert(&mut self, f: DatFrame) -> bool {
+        let Some(i) = self.slot(f.sn()) else {
+            return false;
+        };
+        match self.slots[i] {
+            Some(old) if old.sn() != f.sn() => {
+                debug_assert!(false, "slot of {} holds {}", f.sn(), old.sn());
+                false
+            }
+            _ => {
+                self.slots[i] = Some(f);
+                true
+            }
+        }
     }
 
-    fn take(&mut self, sn: u16) -> Option<DatFrame> {
-        self.slots[(sn as usize) % N].take()
+    /// Removes the frame at `base`, if any, and moves the window forward by one.
+    fn advance(&mut self) -> Option<DatFrame> {
+        let f = self.slots[self.head].take();
+        self.head = (self.head + 1) % N;
+        self.base = (self.base + 1) % MAX_SEQ;
+        f
     }
 }
 
@@ -219,7 +379,7 @@ impl<const N: usize> Ring<N> {
 /// - `R`: read buffer size, in bytes. Must be at least `r::<N>()`.
 /// - `Channel`: the underlying byte-stream channel. With feature `tokio` this
 ///   is any `AsyncRead + AsyncWrite + Unpin` stream; with feature
-///   `embedded-io`, wrap the stream in `embedded_io::EiaLower`.
+///   `embedded-io`, wrap a `PollTransport` in `embedded_io::EiaPoll`.
 /// - `Crc`: the [`Crc16`] algorithm used to protect frames.
 /// - `AckCodecType`: the [`AckCodec`] used to protect ACK frames.
 /// - `Tmr`: the [`Timer`] that schedules retransmissions.
@@ -257,11 +417,13 @@ where
     rbuf: Ring<N>,
     rx_pending: [u8; MAX_FRAME],
     rx_len: usize,
+    rx_eof: bool,
     read_buf: [u8; R],
     read_head: usize,
     read_tail: usize,
-    read_waker: AtomicWaker,
-    write_waker: AtomicWaker,
+    wakers: SharedWakers,
+    #[cfg(feature = "std")]
+    lower_waker: Waker,
     spin_waker: AtomicWaker,
     p_ack_codec: PhantomData<fn() -> AckCodecType>,
 }
@@ -272,6 +434,7 @@ where
     AckCodecType: AckCodec<M>,
 {
     fn new(channel: Channel, crc: Crc, timer: Tmr) -> Self {
+        let wakers = SharedWakers::default();
         Self {
             channel,
             crc,
@@ -302,14 +465,25 @@ where
             rbuf: Ring::new(),
             rx_pending: [0; MAX_FRAME],
             rx_len: 0,
+            rx_eof: false,
             read_buf: [0; R],
             read_head: 0,
             read_tail: 0,
-            read_waker: AtomicWaker::new(),
-            write_waker: AtomicWaker::new(),
+            #[cfg(feature = "std")]
+            lower_waker: Waker::from(wakers.clone()),
+            wakers,
             spin_waker: AtomicWaker::new(),
             p_ack_codec: PhantomData,
         }
+    }
+
+    #[cfg(test)]
+    fn set_seq(&mut self, sn: u16) {
+        self.sb = sn;
+        self.r = sn;
+        self.rn = sn;
+        self.sbuf.base = sn;
+        self.rbuf.base = sn;
     }
 }
 
@@ -327,29 +501,56 @@ where
         cx: &mut Context<'_>,
         op: &mut Op<'_>,
     ) -> Poll<Result<OpOut, ArqError<Channel::Error>>> {
+        // Register before driving the engine so readiness that arrives while
+        // polling wakes this operation.
+        self.register(cx.waker(), op);
+        #[cfg(feature = "std")]
+        let lower = self.lower_waker.clone();
+        #[cfg(feature = "std")]
+        let mut lower_cx = Context::from_waker(&lower);
+        #[cfg(not(feature = "std"))]
+        let mut lower_cx = Context::from_waker(cx.waker());
+        let res = self.poll_op_lower(cx.waker(), &mut lower_cx, op);
+        // Frames processed while driving wake the registered waker, which
+        // would leave a pending operation without one.
+        if res.is_pending() {
+            self.register(cx.waker(), op);
+        }
+        res
+    }
+
+    fn register(&self, waker: &Waker, op: &Op<'_>) {
+        match op {
+            Op::Read { .. } => self.wakers.read.register(waker),
+            _ => self.wakers.write.register(waker),
+        }
+    }
+
+    fn poll_op_lower(
+        &mut self,
+        caller: &Waker,
+        cx: &mut Context<'_>,
+        op: &mut Op<'_>,
+    ) -> Poll<Result<OpOut, ArqError<Channel::Error>>> {
         if self.state == State::Done {
-            return self.poll_closed(cx, op);
+            return self.poll_completed(caller, cx, op);
         }
         match op {
             Op::Read { buf: [] } => Poll::Ready(Ok(OpOut::Read(0))),
             Op::Write { buf: [] } => Poll::Ready(Ok(OpOut::Write(0))),
             Op::Read { .. } => {
-                if self.state == State::RecvDone {
-                    Poll::Ready(Ok(OpOut::Read(0)))
+                let tx = if self.state == State::SendDone {
+                    TxPolicy::Acks
                 } else {
-                    let tx = if self.state == State::SendDone {
-                        TxPolicy::Acks
-                    } else {
-                        TxPolicy::Full
-                    };
-                    self.poll_engine(cx, op, tx)
-                }
+                    TxPolicy::Full
+                };
+                self.poll_engine(caller, cx, op, tx)
             }
             Op::Write { .. } => {
                 if self.fin_armed {
                     Poll::Ready(Err(ArqError::Closed))
                 } else {
-                    self.poll_engine(cx, op, TxPolicy::Full)
+                    self.poll_engine(caller, cx, op, TxPolicy::Full)
                 }
             }
             Op::Flush => {
@@ -358,44 +559,29 @@ where
                 } else {
                     TxPolicy::Flush
                 };
-                self.poll_flush(cx, tx)
+                self.poll_flush(caller, cx, tx)
             }
-            Op::Shutdown => self.poll_shutdown(cx),
+            Op::Shutdown => self.poll_shutdown(caller, cx),
         }
     }
 
     fn poll_engine(
         &mut self,
+        caller: &Waker,
         cx: &mut Context<'_>,
         op: &mut Op<'_>,
         tx: TxPolicy,
     ) -> Poll<Result<OpOut, ArqError<Channel::Error>>> {
-        let mut acted = false;
-        loop {
-            match self.poll_recv_frame(cx) {
-                Poll::Pending => break,
-                Poll::Ready(Ok(frame)) => {
-                    self.on_frame(frame);
-                    acted = true;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            }
-        }
+        let batch = self.service_recv(cx)?;
+        let mut acted = batch.frames > 0 || batch.more;
 
         self.poll_timer(cx);
-        match self.pick_next(tx) {
-            Err(e) => return Poll::Ready(Err(e)),
-            Ok(false) if self.outgoing.is_some() => match self.send_one(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => acted = true,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            },
-            Ok(false) => {}
-            Ok(true) => match self.send_one(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => acted = true,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            },
+        match self.service_tx(cx, tx) {
+            // A stalled lower write or flush must not starve the operation:
+            // data already received can still be read.
+            Poll::Pending => {}
+            Poll::Ready(Ok(sent)) => acted |= sent,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
         }
 
         self.transition();
@@ -404,14 +590,25 @@ where
             return Poll::Ready(Ok(out));
         }
 
-        if matches!(op, Op::Read { .. })
-            && (self.state == State::RecvDone || self.state == State::Done)
-        {
-            return Poll::Ready(Ok(OpOut::Read(0)));
+        match op {
+            Op::Read { .. } => {
+                if self.rx_complete() {
+                    return Poll::Ready(Ok(OpOut::Read(0)));
+                }
+                if self.rx_eof && !self.rx_finished {
+                    return Poll::Ready(Err(ArqError::Closed));
+                }
+            }
+            Op::Write { .. } => {
+                if self.rx_eof && self.w > 0 && self.outgoing.is_none() {
+                    return Poll::Ready(Err(ArqError::Closed));
+                }
+            }
+            Op::Flush | Op::Shutdown => {}
         }
 
         if acted {
-            self.spin_waker.register(cx.waker());
+            self.spin_waker.register(caller);
             self.spin_waker.wake();
         }
         Poll::Pending
@@ -419,144 +616,243 @@ where
 
     fn poll_flush(
         &mut self,
+        caller: &Waker,
         cx: &mut Context<'_>,
         tx: TxPolicy,
     ) -> Poll<Result<OpOut, ArqError<Channel::Error>>> {
-        loop {
-            match self.poll_recv_frame(cx) {
-                Poll::Pending => {}
-                Poll::Ready(Ok(frame)) => self.on_frame(frame),
+        for _ in 0..MAX_ROUNDS {
+            let batch = self.service_recv(cx)?;
+            self.poll_timer(cx);
+            match self.service_tx(cx, tx) {
+                Poll::Pending => {
+                    if batch.more {
+                        caller.wake_by_ref();
+                    }
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(true)) => continue,
+                Poll::Ready(Ok(false)) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
-            self.poll_timer(cx);
-            match self.pick_next(tx) {
-                Err(e) => return Poll::Ready(Err(e)),
-                Ok(true) => match self.send_one(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                },
-                Ok(false) if self.outgoing.is_some() => match self.send_one(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                },
-                Ok(false) => {
-                    let stalled =
-                        self.pending.len > 0 || self.w > 0 || (self.fin_armed && !self.fin_sent);
-                    if stalled {
-                        return Poll::Pending;
-                    }
-                    return match self.channel.poll_flush(cx) {
-                        Poll::Pending => Poll::Pending,
-                        Poll::Ready(Ok(())) => Poll::Ready(Ok(OpOut::Done)),
-                        Poll::Ready(Err(e)) => Poll::Ready(Err(ArqError::Io(e))),
-                    };
-                }
+            if batch.more {
+                continue;
             }
+            let stalled = self.pending.len > 0 || self.w > 0 || (self.fin_armed && !self.fin_sent);
+            if stalled {
+                return if self.rx_eof {
+                    Poll::Ready(Err(ArqError::Closed))
+                } else {
+                    Poll::Pending
+                };
+            }
+            return self.flush_channel(cx);
         }
+        caller.wake_by_ref();
+        Poll::Pending
     }
 
     fn poll_shutdown(
         &mut self,
+        caller: &Waker,
         cx: &mut Context<'_>,
     ) -> Poll<Result<OpOut, ArqError<Channel::Error>>> {
         self.fin_armed = true;
-        loop {
-            if self.tx_done {
-                return self.flush_channel(cx);
-            }
-            match self.poll_recv_frame(cx) {
-                Poll::Pending => {}
-                Poll::Ready(Ok(frame)) => self.on_frame(frame),
+        for _ in 0..MAX_ROUNDS {
+            let batch = self.service_recv(cx)?;
+            self.poll_timer(cx);
+            let tx = if self.tx_done {
+                TxPolicy::Acks
+            } else {
+                TxPolicy::Flush
+            };
+            match self.service_tx(cx, tx) {
+                Poll::Pending => {
+                    if batch.more {
+                        caller.wake_by_ref();
+                    }
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(true)) => continue,
+                Poll::Ready(Ok(false)) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
+            if batch.more {
+                continue;
+            }
             if self.tx_done {
                 return self.flush_channel(cx);
             }
-            self.poll_timer(cx);
-            match self.pick_next(TxPolicy::Flush) {
-                Err(e) => return Poll::Ready(Err(e)),
-                Ok(true) => match self.send_one(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                },
-                Ok(false) if self.outgoing.is_some() => match self.send_one(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                },
-                Ok(false) => return Poll::Pending,
-            }
+            return if self.rx_eof {
+                Poll::Ready(Err(ArqError::Closed))
+            } else {
+                Poll::Pending
+            };
         }
+        caller.wake_by_ref();
+        Poll::Pending
     }
 
-    fn poll_closed(
+    /// Application data transfer is complete. Frames are still received so a
+    /// duplicate FIN, which means the peer lost our ACK, is acknowledged again.
+    fn poll_completed(
         &mut self,
+        caller: &Waker,
         cx: &mut Context<'_>,
         op: &mut Op<'_>,
     ) -> Poll<Result<OpOut, ArqError<Channel::Error>>> {
-        match op {
-            Op::Read { .. } => Poll::Ready(Ok(OpOut::Read(0))),
-            Op::Write { .. } => Poll::Ready(Err(ArqError::Closed)),
-            Op::Flush | Op::Shutdown => self.flush_channel(cx),
+        if matches!(op, Op::Write { .. }) {
+            return Poll::Ready(Err(ArqError::Closed));
         }
+        for _ in 0..MAX_ROUNDS {
+            let batch = self.service_recv(cx)?;
+            match self.service_tx(cx, TxPolicy::Acks) {
+                Poll::Pending => {
+                    if batch.more {
+                        caller.wake_by_ref();
+                    }
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(true)) => continue,
+                Poll::Ready(Ok(false)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            }
+            if batch.more {
+                continue;
+            }
+            return match op {
+                Op::Read { .. } => Poll::Ready(Ok(OpOut::Read(0))),
+                _ => self.flush_channel(cx),
+            };
+        }
+        caller.wake_by_ref();
+        Poll::Pending
     }
 
     fn flush_channel(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<OpOut, ArqError<Channel::Error>>> {
-        match self.channel.poll_flush(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(OpOut::Done)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(ArqError::Io(e))),
+        self.channel
+            .poll_flush(cx)
+            .map(|r| r.map(|()| OpOut::Done).map_err(ArqError::Io))
+    }
+
+    /// Takes frames from the lower channel until it is idle, at its end, or
+    /// the work budget is spent.
+    fn service_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<RecvBatch, ArqError<Channel::Error>> {
+        let mut budget = RX_BUDGET;
+        let mut frames = 0;
+        loop {
+            match self.poll_recv_frame(cx, &mut budget)? {
+                Recv::Frame(frame) => {
+                    self.on_frame(frame);
+                    frames += 1;
+                }
+                Recv::Pending | Recv::Eof => {
+                    return Ok(RecvBatch {
+                        frames,
+                        more: false,
+                    });
+                }
+                Recv::Budget => return Ok(RecvBatch { frames, more: true }),
+            }
         }
     }
 
     fn poll_recv_frame(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Frame, ArqError<Channel::Error>>> {
-        loop {
-            match Frame::wire_len::<AckCodecType, M, _>(&self.crc, &self.rx_pending[..self.rx_len])
-            {
-                Err(FrameError::TooShort(_)) => {}
-                Err(_) if self.rx_len < M => {}
-                Err(e) => return Poll::Ready(Err(ArqError::Framing(e))),
-                Ok(len) if self.rx_len >= len => {
-                    match Frame::from_bytes::<AckCodecType, M, _>(
-                        &self.crc,
-                        &self.rx_pending[..len],
-                    ) {
-                        Err(_) if self.rx_len < M => {}
-                        res => {
-                            self.rx_pending.copy_within(len..self.rx_len, 0);
-                            self.rx_len -= len;
-                            match res {
-                                Ok(frame) => return Poll::Ready(Ok(frame)),
-                                Err(FrameError::CrcMismatch(..)) => continue,
-                                Err(e) => return Poll::Ready(Err(ArqError::Framing(e))),
-                            }
-                        }
-                    }
+        budget: &mut usize,
+    ) -> Result<Recv, ArqError<Channel::Error>> {
+        if Channel::FRAMED_RECV {
+            // Bound corrupt-frame work so noise cannot starve retransmissions.
+            loop {
+                if self.rx_eof {
+                    return Ok(Recv::Eof);
                 }
-                Ok(_) if self.rx_len >= MAX_FRAME => {
-                    return Poll::Ready(Err(ArqError::Framing(FrameError::TooLong(MAX_FRAME))));
+                if *budget == 0 {
+                    return Ok(Recv::Budget);
+                }
+                *budget -= 1;
+                match self.channel.poll_recv(cx, &mut self.rx_pending) {
+                    Poll::Pending => return Ok(Recv::Pending),
+                    Poll::Ready(Ok(0)) => self.rx_eof = true,
+                    Poll::Ready(Ok(n)) => {
+                        let Some(bytes) = self.rx_pending.get(..n) else {
+                            continue;
+                        };
+                        if let Ok(frame) = Frame::from_bytes::<AckCodecType, M, _>(&self.crc, bytes)
+                        {
+                            return Ok(Recv::Frame(frame));
+                        }
+                        // No rx_len is retained: the entire invalid frame is gone.
+                    }
+                    Poll::Ready(Err(e)) => return Err(ArqError::Io(e)),
+                }
+            }
+        }
+        loop {
+            match Frame::wire_len::<M>(&self.rx_pending[..self.rx_len]) {
+                Err(FrameError::TooShort(_)) => {}
+                Err(e) => return Err(ArqError::Framing(e)),
+                Ok(len) if self.rx_len >= len => {
+                    if *budget == 0 {
+                        return Ok(Recv::Budget);
+                    }
+                    *budget -= 1;
+                    // The length comes from an unprotected header, so it is only
+                    // a candidate until the frame validates. A failed candidate
+                    // is kept: its remainder cannot be trusted to start a frame,
+                    // so reception stays failed and the lower channel is no
+                    // longer read.
+                    let frame =
+                        Frame::from_bytes::<AckCodecType, M, _>(&self.crc, &self.rx_pending[..len])
+                            .map_err(ArqError::Framing)?;
+                    self.rx_pending.copy_within(len..self.rx_len, 0);
+                    self.rx_len -= len;
+                    return Ok(Recv::Frame(frame));
                 }
                 Ok(_) => {}
             }
+            // Complete frames are consumed above, so a remainder at lower EOF
+            // is a frame cut short, which is never delivered.
+            if self.rx_eof {
+                return Ok(Recv::Eof);
+            }
+            if *budget == 0 {
+                return Ok(Recv::Budget);
+            }
+            *budget -= 1;
             match self
                 .channel
                 .poll_recv(cx, &mut self.rx_pending[self.rx_len..])
             {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(ArqError::Closed)),
+                Poll::Pending => return Ok(Recv::Pending),
+                Poll::Ready(Ok(0)) => self.rx_eof = true,
                 Poll::Ready(Ok(n)) => self.rx_len += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(ArqError::Io(e))),
+                Poll::Ready(Err(e)) => return Err(ArqError::Io(e)),
             }
         }
+    }
+
+    /// Sends the next frame, if there is one. Returns whether a frame was
+    /// completed; a frame that was started stays in `outgoing` across polls.
+    fn service_tx(
+        &mut self,
+        cx: &mut Context<'_>,
+        tx: TxPolicy,
+    ) -> Poll<Result<bool, ArqError<Channel::Error>>> {
+        let picked = match self.pick_next(tx) {
+            Ok(picked) => picked,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        if !picked && self.outgoing.is_none() {
+            return Poll::Ready(Ok(false));
+        }
+        self.send_one(cx).map_ok(|()| true)
     }
 
     fn pick_next(&mut self, tx: TxPolicy) -> Result<bool, ArqError<Channel::Error>> {
@@ -565,7 +861,7 @@ where
         }
         if let Some(an) = self.ack_pending.take() {
             let ack = AckFrame::new(&self.crc, an)?;
-            return self.arm_outgoing(&Frame::Ack(ack)).map(|_| true);
+            return self.arm_outgoing(&Frame::Ack(ack), false).map(|_| true);
         }
         if tx == TxPolicy::Acks {
             return Ok(false);
@@ -578,20 +874,19 @@ where
             };
             self.r = (self.r + 1) % MAX_SEQ;
             self.retx -= 1;
-            if self.retx == 0 {
-                self.restart_timer();
-            }
-            return self.arm_outgoing(&Frame::from_dat(f)).map(|_| true);
+            return self
+                .arm_outgoing(&Frame::from_dat(f), self.retx == 0)
+                .map(|_| true);
         }
         if self.fin_armed && !self.fin_sent && self.w < N {
             let sn = (self.sb + self.w as u16) % MAX_SEQ;
             let fin = DatFrame::new_fin(&self.crc, sn, &self.pending.buf[..self.pending.len]);
-            self.sbuf.set(sn, fin);
+            let stored = self.sbuf.insert(fin);
+            debug_assert!(stored);
             self.fin_sent = true;
             self.pending.len = 0;
             self.w += 1;
-            self.arm_timer();
-            return self.arm_outgoing(&Frame::Fin(fin)).map(|_| true);
+            return self.arm_outgoing(&Frame::Fin(fin), true).map(|_| true);
         }
         if self.w < N && self.pending.len > 0 {
             let sn = (self.sb + self.w as u16) % MAX_SEQ;
@@ -601,11 +896,11 @@ where
             } else {
                 DatFrame::new_dat(&self.crc, sn, payload)
             };
-            self.sbuf.set(sn, dat);
+            let stored = self.sbuf.insert(dat);
+            debug_assert!(stored);
             self.pending.len = 0;
             self.w += 1;
-            self.arm_timer();
-            return self.arm_outgoing(&Frame::from_dat(dat)).map(|_| true);
+            return self.arm_outgoing(&Frame::from_dat(dat), true).map(|_| true);
         }
         if tx == TxPolicy::Flush
             && self.w > 0
@@ -616,8 +911,8 @@ where
             match self.sbuf.get(last) {
                 Some(f) if !f.is_fin() && !f.requests_ack() => {
                     let f = f.to_ack_req(&self.crc);
-                    self.sbuf.set(last, f);
-                    return self.arm_outgoing(&Frame::DatAckReq(f)).map(|_| true);
+                    self.sbuf.insert(f);
+                    return self.arm_outgoing(&Frame::DatAckReq(f), false).map(|_| true);
                 }
                 _ => {}
             }
@@ -656,39 +951,61 @@ where
         self.rto = self.rto.saturating_mul(2).min(self.rto_max);
     }
 
-    fn arm_outgoing(&mut self, frame: &Frame) -> Result<(), ArqError<Channel::Error>> {
+    fn arm_outgoing(
+        &mut self,
+        frame: &Frame,
+        arm_timer: bool,
+    ) -> Result<(), ArqError<Channel::Error>> {
         let mut buf = [0u8; MAX_FRAME];
         let n = frame
             .to_bytes::<AckCodecType, M>(&mut buf)
             .map_err(ArqError::InvalidAck)?;
+        let kind = match frame {
+            Frame::Ack(_) => OutgoingKind::Ack,
+            _ => OutgoingKind::Data,
+        };
         self.outgoing = Some(Outgoing {
+            kind,
             buf,
             off: 0,
             total: n,
+            flushing: false,
+            arm_timer,
         });
         Ok(())
     }
 
+    /// Writes the remaining bytes of the outgoing frame, then flushes the
+    /// channel. The frame is delivered only once the flush completes.
     fn send_one(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ArqError<Channel::Error>>> {
         loop {
-            let (off, total) = match &self.outgoing {
-                None => return Poll::Ready(Ok(())),
-                Some(o) => (o.off, o.total),
-            };
-            if off == total {
-                self.outgoing = None;
+            let Some(out) = self.outgoing.as_mut() else {
                 return Poll::Ready(Ok(()));
-            }
-            let res = {
-                let ch = &mut self.channel;
-                let out = self.outgoing.as_mut().unwrap();
-                ch.poll_send(cx, &out.buf[off..total])
             };
-            match res {
+            if !out.flushing {
+                if out.off == out.total {
+                    out.flushing = true;
+                    continue;
+                }
+                match self.channel.poll_send(cx, &out.buf[out.off..out.total]) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Err(ArqError::Closed)),
+                    Poll::Ready(Ok(n)) => out.off += n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(ArqError::Io(e))),
+                }
+                continue;
+            }
+            match self.channel.poll_flush(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(ArqError::Closed)),
-                Poll::Ready(Ok(n)) => self.outgoing.as_mut().unwrap().off += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(ArqError::Io(e))),
+                Poll::Ready(Ok(())) => {
+                    let arm = out.arm_timer;
+                    self.outgoing = None;
+                    if arm && self.w > 0 {
+                        self.arm_timer();
+                    }
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
@@ -710,7 +1027,8 @@ where
             self.r = an;
         }
         for _ in 0..d as usize {
-            if let Some(f) = self.sbuf.take(self.sb) {
+            debug_assert_eq!(self.sbuf.base, self.sb);
+            if let Some(f) = self.sbuf.advance() {
                 if f.is_fin() {
                     self.fin_acked = true;
                 }
@@ -726,7 +1044,7 @@ where
         }
         self.tx_done = self.w == 0 && self.fin_acked;
         if self.w < N {
-            self.write_waker.wake();
+            self.wakers.write.wake();
         }
     }
 
@@ -747,9 +1065,11 @@ where
             if !self.push_read(f.payload()) {
                 return;
             }
+            // Drop any copy of this frame left over from a full read buffer.
+            self.rbuf.advance();
             self.rn = (self.rn + 1) % MAX_SEQ;
             self.acount += 1;
-            self.read_waker.wake();
+            self.wakers.read.wake();
             if is_fin {
                 self.rx_finished = true;
                 self.schedule_ack();
@@ -757,17 +1077,14 @@ where
             }
             let mut drained = false;
             while let Some(next) = self.rbuf.get(self.rn) {
-                if next.sn() != self.rn {
-                    break;
-                }
                 if !self.push_read(next.payload()) {
                     break;
                 }
-                self.rbuf.take(self.rn);
+                self.rbuf.advance();
                 self.rn = (self.rn + 1) % MAX_SEQ;
                 self.acount += 1;
                 drained = true;
-                self.read_waker.wake();
+                self.wakers.read.wake();
                 if next.is_fin() {
                     self.rx_finished = true;
                     break;
@@ -780,7 +1097,7 @@ where
             match self.rbuf.get(sn) {
                 Some(b) if b.sn() == sn => self.schedule_ack(),
                 _ => {
-                    self.rbuf.set(sn, f);
+                    self.rbuf.insert(f);
                     if f.requests_ack() {
                         self.schedule_ack();
                     }
@@ -840,11 +1157,21 @@ where
         }
     }
 
+    /// An ACK is queued or still being written or flushed.
+    fn ack_work_pending(&self) -> bool {
+        self.ack_pending.is_some()
+            || matches!(&self.outgoing, Some(out) if out.kind == OutgoingKind::Ack)
+    }
+
+    /// The peer's FIN was received and acknowledged, and its data is drained.
+    fn rx_complete(&self) -> bool {
+        self.rx_finished && self.read_head == self.read_tail && !self.ack_work_pending()
+    }
+
     fn transition(&mut self) {
-        let rx_drained = self.rx_finished && self.read_head == self.read_tail;
-        self.state = match (self.tx_done, rx_drained) {
-            (true, true) => State::Done,
-            (true, false) => State::SendDone,
+        self.state = match (self.tx_done, self.rx_complete()) {
+            (true, true) if self.outgoing.is_none() => State::Done,
+            (true, _) => State::SendDone,
             (false, true) => State::RecvDone,
             (false, false) => State::Active,
         };

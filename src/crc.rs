@@ -12,35 +12,21 @@ impl<F: Fn(&[&[u8]]) -> u16> Crc16 for F {
     }
 }
 
-impl Crc16 for crc::Crc<u16> {
-    fn checksum_concat<const N: usize>(&self, chunks: [&[u8]; N]) -> u16 {
-        let mut d = self.digest();
-        for chunk in chunks {
-            d.update(chunk);
+macro_rules! impl_crc16 {
+    ($($ty:ty),*) => {$(
+        impl Crc16 for $ty {
+            fn checksum_concat<const N: usize>(&self, chunks: [&[u8]; N]) -> u16 {
+                let mut d = self.digest();
+                for chunk in chunks {
+                    d.update(chunk);
+                }
+                d.finalize()
+            }
         }
-        d.finalize()
-    }
+    )*};
 }
 
-impl Crc16 for crc::Crc<u16, crc::NoTable> {
-    fn checksum_concat<const N: usize>(&self, chunks: [&[u8]; N]) -> u16 {
-        let mut d = self.digest();
-        for chunk in chunks {
-            d.update(chunk);
-        }
-        d.finalize()
-    }
-}
-
-impl Crc16 for crc::Crc<u16, crc::Table<16>> {
-    fn checksum_concat<const N: usize>(&self, chunks: [&[u8]; N]) -> u16 {
-        let mut d = self.digest();
-        for chunk in chunks {
-            d.update(chunk);
-        }
-        d.finalize()
-    }
-}
+impl_crc16!(crc::Crc<u16>, crc::Crc<u16, crc::NoTable>, crc::Crc<u16, crc::Table<16>>);
 
 #[cfg(test)]
 mod tests {

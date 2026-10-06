@@ -112,6 +112,24 @@ mod std_timer {
         closed: bool,
     }
 
+    #[derive(Debug, Default, Clone, Copy)]
+    enum Deadline {
+        #[default]
+        Stopped,
+        At(Instant),
+        /// Armed, but too far away to represent; never expires.
+        Never,
+    }
+
+    impl Deadline {
+        fn instant(self) -> Option<Instant> {
+            match self {
+                Deadline::At(at) => Some(at),
+                Deadline::Stopped | Deadline::Never => None,
+            }
+        }
+    }
+
     #[derive(Debug, Default)]
     struct Shared {
         inner: Mutex<Inner>,
@@ -133,10 +151,13 @@ mod std_timer {
     /// deadline and exits when the timer is dropped. Each timer has at most
     /// one helper thread.
     ///
+    /// A timeout too large to add to the current [`Instant`] never expires and
+    /// starts no thread; [`Timer::stop`] or a new [`Timer::start`] replaces it.
+    ///
     /// Requires the `std` feature, which `tokio` enables.
     #[derive(Debug, Default)]
     pub struct StdTimer {
-        deadline: Option<Instant>,
+        deadline: Deadline,
         shared: Arc<Shared>,
         spawned: bool,
     }
@@ -147,10 +168,10 @@ mod std_timer {
             Self::default()
         }
 
-        fn set_deadline(&mut self, deadline: Option<Instant>) {
+        fn set_deadline(&mut self, deadline: Deadline) {
             self.deadline = deadline;
             if self.spawned {
-                self.shared.lock().deadline = deadline;
+                self.shared.lock().deadline = deadline.instant();
                 self.shared.cv.notify_one();
             }
         }
@@ -160,7 +181,7 @@ mod std_timer {
                 return;
             }
             self.spawned = true;
-            self.shared.lock().deadline = self.deadline;
+            self.shared.lock().deadline = self.deadline.instant();
             let shared = self.shared.clone();
             std::thread::spawn(move || {
                 let mut inner = shared.lock();
@@ -197,15 +218,19 @@ mod std_timer {
 
     impl Timer for StdTimer {
         fn start(&mut self, timeout: Duration) {
-            self.set_deadline(Some(Instant::now() + timeout));
+            let deadline = match Instant::now().checked_add(timeout) {
+                Some(at) => Deadline::At(at),
+                None => Deadline::Never,
+            };
+            self.set_deadline(deadline);
         }
 
         fn stop(&mut self) {
-            self.set_deadline(None);
+            self.set_deadline(Deadline::Stopped);
         }
 
         fn poll_expired(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-            let Some(deadline) = self.deadline else {
+            let Deadline::At(deadline) = self.deadline else {
                 return Poll::Pending;
             };
             if Instant::now() >= deadline {
@@ -230,5 +255,38 @@ mod std_timer {
                 self.shared.cv.notify_one();
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use core::task::{Context, Poll, Waker};
+    use core::time::Duration;
+
+    use super::{StdTimer, Timer};
+
+    #[test]
+    fn unrepresentable_timeout_does_not_panic_or_expire() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut timer = StdTimer::new();
+        timer.start(Duration::MAX);
+        assert_eq!(timer.poll_expired(&mut cx), Poll::Pending);
+        assert_eq!(timer.poll_expired(&mut cx), Poll::Pending);
+        timer.stop();
+        assert_eq!(timer.poll_expired(&mut cx), Poll::Pending);
+    }
+
+    #[test]
+    fn finite_timeout_replaces_unrepresentable_timeout() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut timer = StdTimer::new();
+        timer.start(Duration::MAX);
+        assert_eq!(timer.poll_expired(&mut cx), Poll::Pending);
+        timer.start(Duration::from_millis(10));
+        assert_eq!(timer.poll_expired(&mut cx), Poll::Pending);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(timer.poll_expired(&mut cx), Poll::Ready(()));
+        timer.start(Duration::MAX);
+        assert_eq!(timer.poll_expired(&mut cx), Poll::Pending);
     }
 }

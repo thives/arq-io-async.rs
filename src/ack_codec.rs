@@ -3,6 +3,10 @@ use crate::crc::Crc16;
 use crate::error::AckError;
 use crate::frame::AckFrame;
 
+/// The most bit errors accepted in either half of a codeword: the number the
+/// BCH code is guaranteed to correct.
+const MAX_CORRECTIONS: usize = 11;
+
 /// Encodes and decodes the error-correcting codeword that carries ACK frames.
 ///
 /// The codeword is `ACK_CODEWORD_LEN` bytes long.
@@ -11,6 +15,10 @@ pub trait AckCodec<const ACK_CODEWORD_LEN: usize> {
     fn encode_ack(frame: AckFrame) -> Result<[u8; ACK_CODEWORD_LEN], AckError>;
     /// Decodes the codeword into an [`AckFrame`], validating the frame with
     /// `crc`.
+    ///
+    /// Implementations should reject a codeword that cannot be decoded
+    /// reliably, rather than return a frame that needed more corrections than
+    /// the code guarantees.
     fn decode_ack<C: Crc16>(
         crc: &C,
         codeword: &[u8; ACK_CODEWORD_LEN],
@@ -20,12 +28,17 @@ pub trait AckCodec<const ACK_CODEWORD_LEN: usize> {
 /// A BCH error-correcting [`AckCodec`] for 16-byte codewords.
 ///
 /// The codeword carries two 8-byte BCH codewords, each protecting a 16-bit
-/// value and correcting up to 11 bit errors: the frame's packet identifier
-/// in the first half and the frame CRC in the second half.
+/// value: the frame's packet identifier in the first half and the frame CRC
+/// in the second half.
 ///
-/// Decoding fails with [`AckError::DecodeError`] when a half has more bit
-/// errors than it can correct, and with [`AckError::FrameError`] when the
+/// Up to 11 bit errors in each half are corrected. Decoding fails with
+/// [`AckError::DecodeError`] when a half cannot be decoded or needed more
+/// than 11 corrections, and with [`AckError::FrameError`] when the
 /// reconstructed frame fails validation.
+///
+/// Beyond 11 bit errors a half can still decode to a different, valid
+/// codeword. The CRC check makes accepting such an ACK unlikely, but it is
+/// additional validation, not a guarantee.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BchAckCodec;
 
@@ -39,10 +52,14 @@ impl AckCodec<16> for BchAckCodec {
     }
 
     fn decode_ack<C: Crc16>(crc: &C, codeword: &[u8; 16]) -> Result<AckFrame, AckError> {
-        let (pkt_id, _) = decode(u64::from_le_bytes(codeword[..8].try_into().unwrap()))
-            .ok_or(AckError::DecodeError)?;
-        let (crc2, _) = decode(u64::from_le_bytes(codeword[8..].try_into().unwrap()))
-            .ok_or(AckError::DecodeError)?;
+        let half = |bytes: &[u8]| {
+            decode(u64::from_le_bytes(bytes.try_into().unwrap()))
+                .filter(|&(_, corrected)| corrected <= MAX_CORRECTIONS)
+                .map(|(word, _)| word)
+                .ok_or(AckError::DecodeError)
+        };
+        let pkt_id = half(&codeword[..8])?;
+        let crc2 = half(&codeword[8..])?;
         Ok(AckFrame::from_parts(crc, pkt_id, crc2)?)
     }
 }

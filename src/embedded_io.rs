@@ -1,16 +1,23 @@
 //! The `embedded_io_async` interface for [`Arq`].
 //!
 //! `Arq` implements [`embedded_io_async::Read`] and
-//! [`embedded_io_async::Write`], and [`EiaLower`] adapts an
-//! `embedded_io_async` stream to the channel interface.
+//! [`embedded_io_async::Write`]. The lower channel is a [`PollTransport`]
+//! wrapped in [`EiaPoll`], or a frame-oriented transport wrapped in
+//! [`EiaFramed`].
 //!
 //! Without the `std` feature, build instances with
 //! [`ArqLayer::build_with_timer`](crate::ArqLayer::build_with_timer) and a
 //! [`Timer`] for your platform.
 //!
-//! [`EiaLower`] requires the stream's operations to be cancel-safe; see its
-//! documentation.
+//! `Arq` is a polled state machine and cannot keep an `async` operation of the
+//! lower stream alive between polls. [`PollTransport`] therefore exposes poll
+//! methods, so a transport keeps an operation in progress in its own state.
+//!
+//! A `read` that returns `0` marks the end of the peer's stream, not a point
+//! after which polling may stop: a lost ACK for the final frame is recovered
+//! only while the instance keeps being polled.
 
+use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -22,46 +29,109 @@ use crate::timer::Timer;
 use crate::transport::FrameIo;
 use crate::{Op, OpOut};
 
-/// Adapts an `embedded_io_async` stream to the channel interface required by
-/// [`Arq`].
+/// A byte-stream transport whose operations are polled.
 ///
-/// The inner stream must implement both [`embedded_io_async::Read`] and
-/// [`embedded_io_async::Write`].
+/// This is the lower-channel interface for [`EiaPoll`]. It follows stream
+/// semantics and makes no assumption about packet size: use the returned
+/// lengths to determine how much was transferred.
 ///
-/// # Cancellation requirement
+/// An operation that returns [`Poll::Pending`] stays in progress inside the
+/// transport. `Arq` may poll a different operation before polling it again,
+/// and the transport must resume it, without losing or repeating bytes, when
+/// it is polled again. Each method must arrange for the waker in `cx` to be
+/// woken when it can make progress.
+pub trait PollTransport: embedded_io_async::ErrorType {
+    /// Reads into `buf` and returns the number of bytes read. `Ok(0)` for a
+    /// nonempty `buf` means the read side has ended.
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, Self::Error>>;
+    /// Writes a prefix of `buf` and returns the number of bytes accepted.
+    /// `Ok(0)` for a nonempty `buf` is treated as the link being closed.
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>>;
+    /// Completes once every accepted byte has been delivered to the medium.
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+}
+
+/// Adapts a [`PollTransport`] to the channel interface required by [`Arq`].
 ///
-/// `Arq` is a polled state machine, so `EiaLower` cannot keep an `async`
-/// operation alive between polls. On every poll it creates a new `read`,
-/// `write`, or `flush` future on the inner stream, polls it once, and drops it
-/// if it returns `Pending`. The inner stream's operations must therefore be
-/// cancel-safe:
+/// The wrapped transport's operations are polled directly, never recreated,
+/// so transports whose operations need several polls are supported.
+pub struct EiaPoll<S>(pub S);
+
+impl<S: PollTransport> FrameIo for EiaPoll<S> {
+    type Error = S::Error;
+
+    fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        self.0.poll_write(cx, buf)
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, Self::Error>> {
+        self.0.poll_read(cx, buf)
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_flush(cx)
+    }
+}
+
+/// Receives complete, bounded frames from a framing transport.
 ///
-/// - Dropping a pending `read` must not lose bytes that were already received;
-///   they must be returned by a later `read`.
-/// - Dropping a pending `write` must mean nothing was written. Bytes that were
-///   accepted must be reported by a completed `write`.
-/// - Dropping a pending `flush` must leave the stream usable, so that a later
-///   `flush` can complete.
+/// Each call returns one nonempty frame in `buf`, or zero at end-of-stream.
+/// Empty frames must be skipped. Frames must never be truncated, split, or
+/// joined. A successful nonempty read must return the exact number of bytes
+/// copied into `buf`, never more than [`crate::MAX_FRAME`]. Oversized frames
+/// must be rejected with an error rather than truncated.
 ///
-/// Streams backed by a buffer that is filled or drained in the background,
-/// such as interrupt-driven or ring-buffered UARTs, usually meet these
-/// requirements. Drivers that start a transfer inside the future and abort or
-/// lose it when the future is dropped do not, for example some DMA UART
-/// drivers. With such drivers data is lost or corrupted.
+/// The operation must be cancel-safe: dropping a pending future must not lose
+/// any received bytes or frame-boundary state; a later call must resume and
+/// return the same complete frame.
+#[allow(async_fn_in_trait)]
+pub trait ReadFrame: embedded_io_async::ErrorType {
+    /// Read the next complete frame (at most [`crate::MAX_FRAME`] bytes).
+    async fn read_frame(&mut self, buf: &mut [u8; crate::MAX_FRAME]) -> Result<usize, Self::Error>;
+}
+
+/// Adapts a frame-oriented transport to [`Arq`].
 ///
-/// This adapter does not support such drivers. Supporting them would need a
-/// separate poll-based lower-layer interface that keeps the in-progress
-/// operation across polls; this crate does not currently provide one.
-pub struct EiaLower<S>(
-    /// The wrapped stream.
+/// Unlike [`EiaPoll`], receive boundaries are authoritative: ARQ validates
+/// exact lengths, types, CRCs and ACK codewords within each frame, discarding
+/// the whole frame on failure. A reported receive length greater than
+/// [`crate::MAX_FRAME`] is also discarded, without decoding a truncated prefix.
+///
+/// # Transport requirements
+///
+/// Implementing the traits alone is not sufficient; the inner transport must
+/// satisfy these contracts:
+///
+/// - Receives must obey [`ReadFrame`]'s complete-frame, length, EOF, and
+///   cancellation requirements. Empty frames must be skipped, not reported as
+///   EOF. ARQ cannot detect lost, split, or joined frame boundaries reliably.
+/// - Every successful nonempty write must accept the entire supplied ARQ frame
+///   and report its full length. Ordinary writers that return successful partial
+///   writes are not suitable. Transmission may proceed in fragments internally,
+///   but after a pending write is cancelled, a later call must finish that same
+///   frame without duplicating bytes or emitting a prefix as a separate frame.
+/// - Dropping a pending flush must leave the transport usable and allow a later
+///   flush to complete.
+///
+/// On each poll this adapter creates a new read, write, or flush future, polls
+/// it once, and drops it. In-progress state must therefore live in the transport,
+/// not solely in the future.
+pub struct EiaFramed<S>(
+    /// The wrapped framing transport.
     pub S,
 );
 
-impl<S> FrameIo for EiaLower<S>
-where
-    S: embedded_io_async::Read + embedded_io_async::Write,
-{
+impl<S: ReadFrame + embedded_io_async::Write> FrameIo for EiaFramed<S> {
     type Error = S::Error;
+    const FRAMED_RECV: bool = true;
 
     fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
         let mut fut = self.0.write(buf);
@@ -73,7 +143,7 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, Self::Error>> {
-        let mut fut = self.0.read(buf);
+        let mut fut = self.0.read_frame(buf.try_into().expect("ARQ frame buffer"));
         unsafe { Pin::new_unchecked(&mut fut) }.poll(cx)
     }
 
@@ -112,10 +182,10 @@ where
         if buf.is_empty() {
             return Ok(0);
         }
-        match (ReadDrive { arq: self, buf }).await {
-            Ok(OpOut::Read(n)) => Ok(n),
-            Ok(_) => unreachable!(),
-            Err(e) => Err(e),
+        let mut op = Op::Read { buf };
+        match poll_fn(|cx| self.poll_op(cx, &mut op)).await? {
+            OpOut::Read(n) => Ok(n),
+            _ => unreachable!(),
         }
     }
 }
@@ -132,123 +202,17 @@ where
     E: embedded_io_async::Error,
 {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        match (WriteDrive { arq: self, buf }).await {
-            Ok(OpOut::Write(n)) => Ok(n),
-            Ok(_) => unreachable!(),
-            Err(e) => Err(e),
+        let mut op = Op::Write { buf };
+        match poll_fn(|cx| self.poll_op(cx, &mut op)).await? {
+            OpOut::Write(n) => Ok(n),
+            _ => unreachable!(),
         }
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        match (FlushDrive { arq: self }).await {
-            Ok(OpOut::Done) => Ok(()),
-            Ok(_) => unreachable!(),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-#[allow(private_bounds)]
-struct ReadDrive<
-    'a,
-    Channel,
-    Crc,
-    AckCodecType: AckCodec<M>,
-    Tmr,
-    const N: usize,
-    const M: usize,
-    const R: usize,
-> {
-    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>,
-    buf: &'a mut [u8],
-}
-
-impl<Channel, Crc, AckCodecType, Tmr, const N: usize, const M: usize, const R: usize>
-    core::future::Future for ReadDrive<'_, Channel, Crc, AckCodecType, Tmr, N, M, R>
-where
-    Crc: Crc16,
-    AckCodecType: AckCodec<M>,
-    Channel: FrameIo,
-    Tmr: Timer,
-{
-    type Output = Result<OpOut, ArqError<Channel::Error>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut op = Op::Read { buf: this.buf };
-        match this.arq.poll_op(cx, &mut op) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(res) => Poll::Ready(res),
-        }
-    }
-}
-
-#[allow(private_bounds)]
-struct WriteDrive<
-    'a,
-    Channel,
-    Crc,
-    AckCodecType: AckCodec<M>,
-    Tmr,
-    const N: usize,
-    const M: usize,
-    const R: usize,
-> {
-    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>,
-    buf: &'a [u8],
-}
-
-impl<Channel, Crc, AckCodecType, Tmr, const N: usize, const M: usize, const R: usize>
-    core::future::Future for WriteDrive<'_, Channel, Crc, AckCodecType, Tmr, N, M, R>
-where
-    Crc: Crc16,
-    AckCodecType: AckCodec<M>,
-    Channel: FrameIo,
-    Tmr: Timer,
-{
-    type Output = Result<OpOut, ArqError<Channel::Error>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut op = Op::Write { buf: this.buf };
-        match this.arq.poll_op(cx, &mut op) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(res) => Poll::Ready(res),
-        }
-    }
-}
-
-#[allow(private_bounds)]
-struct FlushDrive<
-    'a,
-    Channel,
-    Crc,
-    AckCodecType: AckCodec<M>,
-    Tmr,
-    const N: usize,
-    const M: usize,
-    const R: usize,
-> {
-    arq: &'a mut Arq<N, M, R, Channel, Crc, AckCodecType, Tmr>,
-}
-
-impl<Channel, Crc, AckCodecType, Tmr, const N: usize, const M: usize, const R: usize>
-    core::future::Future for FlushDrive<'_, Channel, Crc, AckCodecType, Tmr, N, M, R>
-where
-    Crc: Crc16,
-    AckCodecType: AckCodec<M>,
-    Channel: FrameIo,
-    Tmr: Timer,
-{
-    type Output = Result<OpOut, ArqError<Channel::Error>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut op = Op::Flush;
-        match this.arq.poll_op(cx, &mut op) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(res) => Poll::Ready(res),
-        }
+        poll_fn(|cx| self.poll_op(cx, &mut Op::Flush))
+            .await
+            .map(drop)
     }
 }
 

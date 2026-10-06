@@ -8,12 +8,13 @@ use core::fmt;
 pub enum ArqError<E> {
     /// An I/O error from the underlying channel.
     Io(E),
-    /// Received data could not be split into frames and the stream cannot be
-    /// resynchronized, e.g. an unknown frame type or an impossible length;
-    /// see [`FrameError`].
+    /// Received data could not be split into frames, or a frame failed
+    /// validation, and the byte stream cannot be resynchronized, e.g. an
+    /// unknown frame type, an impossible length or a bad CRC; see
+    /// [`FrameError`].
     ///
-    /// Complete frames that only fail their CRC check are discarded and
-    /// recovered by retransmission instead of being reported.
+    /// Over a framing transport, invalid frames are discarded and recovered by
+    /// retransmission instead of being reported.
     Framing(FrameError),
     /// An ACK frame could not be decoded; see [`AckError`].
     InvalidAck(AckError),
@@ -140,7 +141,8 @@ impl<E> From<FrameError> for ArqError<E> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AckError {
-    /// The ACK codeword could not be decoded.
+    /// The ACK codeword could not be decoded, or needed more bit corrections
+    /// than the codec accepts.
     DecodeError,
     /// The decoded ACK frame failed validation.
     FrameError(FrameError),

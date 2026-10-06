@@ -35,11 +35,33 @@ where
     }
 }
 
-fn into_io<E>(e: ArqError<E>) -> std::io::Error
+/// Converts an [`ArqError`] into an `std::io::Error`, keeping the error as its
+/// payload.
+///
+/// | Error | Kind |
+/// | --- | --- |
+/// | `Io(std::io::Error)` | the underlying error's kind |
+/// | `Io(other)` | `Other` |
+/// | `Framing`, `InvalidAck` | `InvalidData` |
+/// | `Timeout` | `TimedOut` |
+/// | `Closed` | `BrokenPipe` |
+///
+/// The payload can be recovered with `get_ref` and `downcast_ref`.
+pub(crate) fn into_io<E>(e: ArqError<E>) -> std::io::Error
 where
+    E: 'static,
     ArqError<E>: core::error::Error + Send + Sync + 'static,
 {
-    std::io::Error::other(e)
+    use std::io::ErrorKind;
+    let kind = match &e {
+        ArqError::Io(inner) => (inner as &dyn core::any::Any)
+            .downcast_ref::<std::io::Error>()
+            .map_or(ErrorKind::Other, std::io::Error::kind),
+        ArqError::Framing(_) | ArqError::InvalidAck(_) => ErrorKind::InvalidData,
+        ArqError::Timeout => ErrorKind::TimedOut,
+        ArqError::Closed => ErrorKind::BrokenPipe,
+    };
+    std::io::Error::new(kind, e)
 }
 
 /// Reads in-order data from the peer through the ARQ layer.
@@ -58,7 +80,6 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.read_waker.register(cx.waker());
         let slice = buf.initialize_unfilled();
         if slice.is_empty() {
             return Poll::Ready(Ok(()));
@@ -67,7 +88,7 @@ where
         match this.poll_op(cx, &mut op) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(OpOut::Read(n))) => {
-                buf.set_filled(n);
+                buf.advance(n);
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Ok(_)) => unreachable!(),
@@ -93,7 +114,6 @@ where
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.write_waker.register(cx.waker());
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -108,7 +128,6 @@ where
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.write_waker.register(cx.waker());
         let mut op = Op::Flush;
         match this.poll_op(cx, &mut op) {
             Poll::Pending => Poll::Pending,
@@ -120,7 +139,6 @@ where
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.write_waker.register(cx.waker());
         let mut op = Op::Shutdown;
         match this.poll_op(cx, &mut op) {
             Poll::Pending => Poll::Pending,

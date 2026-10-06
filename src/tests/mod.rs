@@ -3,17 +3,33 @@ use core::convert::Infallible;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::rc::Rc;
+use std::{string::String, vec, vec::Vec};
 
 use crate::Arq;
 use crate::ack_codec::BchAckCodec;
 use crate::error::{ArqError, FrameError};
-use crate::frame::{AckFrame, DatFrame, Frame};
+use crate::frame::{AckFrame, DatFrame, Frame, TYPE_ACK, TYPE_FIN};
 use crate::timer::Timer;
 use crate::transport::FrameIo;
-use crate::{ArqLayer, Op, OpOut, State, r};
+use crate::{ArqLayer, Op, OpOut, State, dist, r};
 
+mod bch_limit;
+mod collision;
 #[cfg(feature = "tokio")]
 mod duplex;
+#[cfg(feature = "embedded-io")]
+mod embedded;
+mod framed;
+#[cfg(feature = "tokio")]
+mod integrated;
+mod lower_flush;
+#[cfg(feature = "tokio")]
+mod readbuf;
+#[cfg(feature = "tokio")]
+mod tokio_errors;
+#[cfg(feature = "tokio")]
+mod wake;
+mod wrap;
 
 type Crc16X25 = ::crc::Crc<u16>;
 type TestArq = Arq<4, 16, { r::<4>() }, MockLink, Crc16X25, BchAckCodec, ManualTimer>;
@@ -137,6 +153,8 @@ struct MockLink {
     rx: Vec<u8>,
     tx: Vec<u8>,
     eof: bool,
+    /// The most bytes one lower read returns.
+    chunk: usize,
 }
 
 impl MockLink {
@@ -145,6 +163,7 @@ impl MockLink {
             rx: Vec::new(),
             tx: Vec::new(),
             eof: false,
+            chunk: usize::MAX,
         }
     }
 }
@@ -169,7 +188,7 @@ impl FrameIo for MockLink {
                 Poll::Pending
             }
         } else {
-            let n = self.rx.len().min(buf.len());
+            let n = self.rx.len().min(buf.len()).min(self.chunk);
             buf[..n].copy_from_slice(&self.rx[..n]);
             self.rx.drain(..n);
             Poll::Ready(Ok(n))
@@ -293,13 +312,20 @@ fn wire_fin(sn: u16, payload: &[u8]) -> Vec<u8> {
     encode_frame(&Frame::Fin(DatFrame::new_fin(&crc16(), sn, payload)))
 }
 
+fn wire_len(bytes: &[u8]) -> Result<usize, FrameError> {
+    Frame::wire_len::<16>(bytes)
+}
+
+fn decode_frame(bytes: &[u8]) -> Result<Frame, FrameError> {
+    Frame::from_bytes::<BchAckCodec, 16, _>(&crc16(), bytes)
+}
+
 fn parse_stream(bytes: &[u8]) -> Vec<Frame> {
     let mut out = Vec::new();
     let mut rest = bytes;
     while !rest.is_empty() {
-        let len = Frame::wire_len::<BchAckCodec, 16, _>(&crc16(), rest).expect("wire len");
-        let frame =
-            Frame::from_bytes::<BchAckCodec, 16, _>(&crc16(), &rest[..len]).expect("frame decode");
+        let len = wire_len(rest).expect("wire len");
+        let frame = decode_frame(&rest[..len]).expect("frame decode");
         out.push(frame);
         rest = &rest[len..];
     }
@@ -369,7 +395,7 @@ fn framing_errors() {
     bytes[0] = 0x01;
     assert!(matches!(
         Frame::from_bytes::<BchAckCodec, 16, _>(&crc, &bytes),
-        Err(FrameError::InvalidType(1))
+        Err(FrameError::LengthMismatch(17, _))
     ));
     let mut bytes = wire_dat(0, b"hi");
     bytes[0] &= !0b11;
@@ -386,21 +412,14 @@ fn framing_errors() {
 
 #[test]
 fn wire_len_covers_all_data_types() {
-    let crc = crc16();
     for bytes in [
         wire_dat(3, b"abc"),
         wire_dat_ack_req(3, b"abc"),
         wire_fin(3, b"abc"),
     ] {
-        assert_eq!(
-            Frame::wire_len::<BchAckCodec, 16, _>(&crc, &bytes).unwrap(),
-            8
-        );
+        assert_eq!(Frame::wire_len::<16>(&bytes).unwrap(), 8);
     }
-    assert_eq!(
-        Frame::wire_len::<BchAckCodec, 16, _>(&crc, &wire_ack(3)).unwrap(),
-        16
-    );
+    assert_eq!(Frame::wire_len::<16>(&wire_ack(3)).unwrap(), 17);
     let mut stream = wire_dat_ack_req(0, b"x");
     stream.extend(wire_dat(1, b"yz"));
     let frames = parse_stream(&stream);
@@ -418,8 +437,8 @@ fn bch_corruption() {
         other => panic!("unexpected frame: {other:?}"),
     }
     let mut bytes = wire_ack(5);
-    for i in 0..3 {
-        bytes[i] ^= 0xFF;
+    for b in bytes.iter_mut().take(3) {
+        *b ^= 0xFF;
     }
     match Frame::from_bytes::<BchAckCodec, 16, _>(&crc, &bytes) {
         Err(_) => {}
@@ -697,49 +716,47 @@ fn duplicate_in_order_frame_ignored() {
 }
 
 #[test]
-fn corrupted_dat_is_discarded() {
+fn corrupted_dat_fails_the_stream() {
     let mut arq = make_arq();
     let mut peer = Peer::new();
     let mut off = 0usize;
     let mut bytes = wire_dat(0, b"hello world!");
     bytes[9] ^= 0xFF;
+    let len = bytes.len();
     peer.push(bytes);
     peer.respond(&mut arq, &mut off);
     let mut buf = [0u8; 8];
     let mut op = Op::Read { buf: &mut buf };
-    assert!(drive(&mut arq, &mut op, &mut peer, &mut off, 9).is_none());
-    assert_eq!(arq.rx_len, 0, "corrupt frame must be consumed");
+    assert!(matches!(
+        drive(&mut arq, &mut op, &mut peer, &mut off, 9),
+        Some(Err(ArqError::Framing(FrameError::CrcMismatch(..))))
+    ));
+    assert_eq!(arq.rx_len, len, "failed candidate must be kept");
     assert_eq!(arq.rn, 0);
 }
 
 #[test]
-fn corrupt_frame_recovered_by_retransmission() {
+fn corrupt_frame_is_not_skipped_to_a_later_valid_frame() {
     let mut arq = make_arq();
     let mut peer = Peer::new();
     let mut off = 0usize;
     let mut bytes = wire_dat(0, b"hello");
     bytes[7] ^= 0x10;
     peer.push(bytes);
-    peer.push(wire_dat(1, b" world"));
     peer.push(wire_dat(0, b"hello"));
-    peer.push(wire_dat(1, b" world"));
-    peer.push(wire_fin(2, b"!"));
+    peer.push(wire_fin(1, b"!"));
     peer.respond(&mut arq, &mut off);
-    let mut got = Vec::new();
-    loop {
-        let mut buf = [0u8; 64];
-        let mut op = Op::Read { buf: &mut buf };
-        match drive_out(&mut arq, &mut op, &mut peer, &mut off, 100) {
-            OpOut::Read(0) => break,
-            OpOut::Read(n) => got.extend_from_slice(&buf[..n]),
-            other => panic!("unexpected read result: {other:?}"),
-        }
-    }
-    assert_eq!(got, b"hello world!");
+    let mut buf = [0u8; 64];
+    let mut op = Op::Read { buf: &mut buf };
+    assert!(matches!(
+        drive(&mut arq, &mut op, &mut peer, &mut off, 100),
+        Some(Err(ArqError::Framing(FrameError::CrcMismatch(..))))
+    ));
+    assert_eq!(arq.rn, 0);
 }
 
 #[test]
-fn corrupt_frame_before_ack_is_discarded() {
+fn corrupt_frame_before_ack_does_not_complete_flush() {
     let mut arq = make_arq();
     let mut peer = Peer::new();
     let mut off = 0usize;
@@ -753,8 +770,126 @@ fn corrupt_frame_before_ack_is_discarded() {
     peer.push(wire_ack(1));
     peer.respond(&mut arq, &mut off);
     assert!(matches!(
-        drive_out(&mut arq, &mut op, &mut peer, &mut off, 20),
-        OpOut::Done
+        drive(&mut arq, &mut op, &mut peer, &mut off, 20),
+        Some(Err(ArqError::Framing(FrameError::CrcMismatch(..))))
+    ));
+    assert_eq!((arq.sb, arq.w), (0, 1), "frame must stay outstanding");
+}
+
+/// A DAT whose length byte is corrupted to zero. The bytes the original
+/// length covered are an ACK for sequence 1 and a valid DAT.
+fn length_corrupted_dat() -> Vec<u8> {
+    let mut inner = wire_ack(1);
+    inner.extend(wire_dat(0, b"forged"));
+    let mut bytes = wire_dat(0, &inner);
+    assert_eq!(bytes[2] as usize, inner.len());
+    bytes[2] = 0;
+    bytes
+}
+
+/// A FIN whose type bits are corrupted to ACK. The payload is an ACK for
+/// sequence 1 and a valid DAT.
+fn type_corrupted_fin() -> Vec<u8> {
+    let mut inner = wire_ack(1);
+    inner.extend(wire_dat(0, b"forged"));
+    let mut bytes = wire_fin(0, &inner);
+    bytes[0] ^= TYPE_FIN ^ TYPE_ACK;
+    bytes
+}
+
+/// Corrupted frames, each with a read-boundary pattern: whole, one byte at
+/// a time, and coalesced with a valid frame behind it.
+fn corrupted_streams() -> Vec<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    for bad in [length_corrupted_dat(), type_corrupted_fin()] {
+        let mut coalesced = bad.clone();
+        coalesced.extend(wire_ack(1));
+        coalesced.extend(wire_dat(0, b"after"));
+        out.push((bad.clone(), usize::MAX));
+        out.push((bad, 1));
+        out.push((coalesced.clone(), usize::MAX));
+        out.push((coalesced, 1));
+    }
+    out
+}
+
+fn stream_with_outstanding_write(rx: Vec<u8>, chunk: usize) -> TestArq {
+    let mut arq = make_arq();
+    let mut cx = noop_cx();
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Write { buf: b"abc" }),
+        Poll::Ready(Ok(OpOut::Write(3)))
+    ));
+    assert!(arq.poll_op(&mut cx, &mut Op::Flush).is_pending());
+    assert_eq!(arq.w, 1);
+    arq.channel.rx = rx;
+    arq.channel.chunk = chunk;
+    arq
+}
+
+#[test]
+fn header_corruption_cannot_acknowledge_outstanding_data() {
+    let mut cx = noop_cx();
+    for (rx, chunk) in corrupted_streams() {
+        let mut arq = stream_with_outstanding_write(rx, chunk);
+        for _ in 0..3 {
+            assert!(
+                matches!(
+                    arq.poll_op(&mut cx, &mut Op::Flush),
+                    Poll::Ready(Err(ArqError::Framing(_)))
+                ),
+                "chunk {chunk}"
+            );
+        }
+        assert_eq!((arq.sb, arq.w), (0, 1), "chunk {chunk}");
+        assert!(!arq.fin_acked && !arq.tx_done, "chunk {chunk}");
+    }
+}
+
+#[test]
+fn header_corruption_cannot_deliver_embedded_data() {
+    let mut cx = noop_cx();
+    for (rx, chunk) in corrupted_streams() {
+        let mut arq = make_arq();
+        arq.channel.rx = rx;
+        arq.channel.chunk = chunk;
+        for _ in 0..3 {
+            let mut buf = [0u8; 64];
+            assert!(
+                matches!(
+                    arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+                    Poll::Ready(Err(ArqError::Framing(_)))
+                ),
+                "chunk {chunk}"
+            );
+            assert_eq!(buf, [0u8; 64], "chunk {chunk}: data was delivered");
+        }
+        assert_eq!(arq.rn, 0, "chunk {chunk}");
+        assert!(!arq.rx_finished, "chunk {chunk}");
+    }
+}
+
+#[test]
+fn failed_stream_stops_reading_the_lower_channel() {
+    let mut cx = noop_cx();
+    let mut arq = make_arq();
+    arq.channel.rx = length_corrupted_dat();
+    let mut buf = [0u8; 8];
+    assert!(
+        arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf })
+            .is_ready()
+    );
+    arq.channel.rx = wire_dat(0, b"later");
+    for _ in 0..2 {
+        assert!(matches!(
+            arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+            Poll::Ready(Err(ArqError::Framing(_)))
+        ));
+    }
+    assert_eq!(arq.channel.rx, wire_dat(0, b"later"), "lower was read");
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Write { buf: b"x" }),
+        Poll::Ready(Err(ArqError::Framing(_)))
     ));
 }
 
@@ -793,18 +928,21 @@ fn short_unparseable_prefix_waits_for_more_bytes() {
 }
 
 #[test]
-fn invalid_type_byte_aborts() {
+fn uncorrectable_ack_fails_the_stream() {
     let mut arq = make_arq();
     let mut peer = Peer::new();
     let mut off = 0usize;
-    peer.push(vec![0x01; 16]);
+    peer.push(vec![0x01; 17]);
+    peer.push(wire_dat(0, b"a"));
+    peer.push(wire_fin(1, b"b"));
     peer.respond(&mut arq, &mut off);
     let mut buf = [0u8; 8];
     let mut op = Op::Read { buf: &mut buf };
     assert!(matches!(
-        drive(&mut arq, &mut op, &mut peer, &mut off, 10),
-        Some(Err(ArqError::Framing(FrameError::InvalidType(1))))
+        drive(&mut arq, &mut op, &mut peer, &mut off, 100),
+        Some(Err(ArqError::Framing(_) | ArqError::InvalidAck(_)))
     ));
+    assert_eq!(arq.rn, 0);
 }
 
 #[test]
@@ -1478,7 +1616,7 @@ impl PartialPeer {
 
     fn poll(&mut self, wire: &mut Vec<u8>) {
         self.rest.extend(core::mem::take(wire));
-        while let Ok(len) = Frame::wire_len::<BchAckCodec, 16, _>(&crc16(), &self.rest) {
+        while let Ok(len) = Frame::wire_len::<16>(&self.rest) {
             if self.rest.len() < len {
                 break;
             }
@@ -1661,4 +1799,264 @@ fn tokio_duplex_async_read_write() {
     }
     assert_eq!(a_got, db);
     assert_eq!(b_got, da);
+}
+
+/// Reads `arq` to the end with `size`-byte reads, returning the payload and
+/// the terminal result.
+fn read_all(arq: &mut TestArq, size: usize) -> (Vec<u8>, Result<(), ArqError<Infallible>>) {
+    let mut peer = Peer::new();
+    let mut off = 0usize;
+    let mut got = Vec::new();
+    for _ in 0..100 {
+        let mut buf = vec![0u8; size];
+        let mut op = Op::Read { buf: &mut buf };
+        match drive(arq, &mut op, &mut peer, &mut off, 20) {
+            Some(Ok(OpOut::Read(0))) => return (got, Ok(())),
+            Some(Ok(OpOut::Read(n))) => got.extend_from_slice(&buf[..n]),
+            Some(Ok(other)) => panic!("unexpected read result: {other:?}"),
+            Some(Err(e)) => return (got, Err(e)),
+            None => panic!("read made no progress"),
+        }
+    }
+    panic!("read did not terminate");
+}
+
+#[test]
+fn dat_fin_then_lower_eof_returns_payload_then_eof() {
+    for size in [1, 3, 16] {
+        let mut arq = make_arq();
+        let mut bytes = wire_dat(0, b"hello");
+        bytes.extend(wire_fin(1, b" world"));
+        arq.channel.rx = bytes;
+        arq.channel.eof = true;
+        let (got, end) = read_all(&mut arq, size);
+        assert_eq!(got, b"hello world", "read size {size}");
+        assert!(end.is_ok(), "read size {size}: {end:?}");
+    }
+}
+
+#[test]
+fn fin_with_payload_then_lower_eof_returns_payload_then_eof() {
+    let mut arq = make_arq();
+    arq.channel.rx = wire_fin(0, b"bye");
+    arq.channel.eof = true;
+    let (got, end) = read_all(&mut arq, 2);
+    assert_eq!(got, b"bye");
+    assert!(end.is_ok(), "{end:?}");
+}
+
+#[test]
+fn dat_then_lower_eof_without_fin_returns_payload_then_closed() {
+    for size in [1, 16] {
+        let mut arq = make_arq();
+        arq.channel.rx = wire_dat(0, b"hello");
+        arq.channel.eof = true;
+        let (got, end) = read_all(&mut arq, size);
+        assert_eq!(got, b"hello", "read size {size}");
+        assert!(
+            matches!(end, Err(ArqError::Closed)),
+            "read size {size}: {end:?}"
+        );
+    }
+}
+
+#[test]
+fn dat_then_truncated_frame_and_lower_eof_returns_payload_then_closed() {
+    let mut arq = make_arq();
+    let mut bytes = wire_dat(0, b"hello");
+    bytes.extend_from_slice(&wire_dat(1, b"world")[..9]);
+    arq.channel.rx = bytes;
+    arq.channel.eof = true;
+    let (got, end) = read_all(&mut arq, 16);
+    assert_eq!(got, b"hello");
+    assert!(matches!(end, Err(ArqError::Closed)), "{end:?}");
+}
+
+#[test]
+fn lower_eof_keeps_writes_going_but_flush_fails_without_possible_ack() {
+    let mut arq = make_arq();
+    arq.channel.eof = true;
+    let mut cx = noop_cx();
+    let mut op = Op::Write { buf: b"abc" };
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut op),
+        Poll::Ready(Ok(OpOut::Write(3)))
+    ));
+    for _ in 0..3 {
+        match arq.poll_op(&mut cx, &mut Op::Flush) {
+            Poll::Ready(Err(ArqError::Closed)) => {
+                assert_eq!(
+                    parse_stream(&arq.channel.tx).len(),
+                    1,
+                    "the data frame must still be sent after lower EOF"
+                );
+                return;
+            }
+            Poll::Ready(other) => panic!("unexpected flush result: {other:?}"),
+            Poll::Pending => {}
+        }
+    }
+    panic!("flush waits forever for an ACK that cannot arrive");
+}
+
+#[test]
+fn shutdown_fails_once_lower_eof_makes_the_ack_impossible() {
+    let mut arq = make_arq();
+    arq.channel.eof = true;
+    let mut cx = noop_cx();
+    for _ in 0..3 {
+        match arq.poll_op(&mut cx, &mut Op::Shutdown) {
+            Poll::Ready(Err(ArqError::Closed)) => return,
+            Poll::Ready(other) => panic!("unexpected shutdown result: {other:?}"),
+            Poll::Pending => {}
+        }
+    }
+    panic!("shutdown waits forever for an ACK that cannot arrive");
+}
+
+/// Polls `op` once with the peer's frames already waiting on the link.
+fn poll_with_waiting(
+    arq: &mut TestArq,
+    rx: Vec<u8>,
+    op: &mut Op,
+) -> Poll<Result<OpOut, ArqError<Infallible>>> {
+    arq.channel.rx.extend(rx);
+    arq.poll_op(&mut noop_cx(), op)
+}
+
+#[test]
+fn dat_and_ack_received_together_complete_flush_without_retransmission() {
+    let clock = Clock::default();
+    let mut arq: TestArq = ArqLayer::<4, Crc16X25, BchAckCodec>::new()
+        .build_with_timer(MockLink::new(), clock.timer());
+    let mut cx = noop_cx();
+    let mut op = Op::Write { buf: b"abc" };
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut op),
+        Poll::Ready(Ok(OpOut::Write(3)))
+    ));
+    assert!(arq.poll_op(&mut cx, &mut Op::Flush).is_pending());
+    let mut both = wire_dat(0, b"peer");
+    both.extend(wire_ack(1));
+    let res = poll_with_waiting(&mut arq, both, &mut Op::Flush);
+    assert!(matches!(res, Poll::Ready(Ok(OpOut::Done))), "{res:?}");
+    assert_eq!(clock.0.borrow().now, Duration::ZERO);
+    assert_eq!(arq.retx, 0);
+}
+
+#[test]
+fn dat_and_ack_received_together_complete_shutdown_without_retransmission() {
+    let clock = Clock::default();
+    let mut arq: TestArq = ArqLayer::<4, Crc16X25, BchAckCodec>::new()
+        .build_with_timer(MockLink::new(), clock.timer());
+    let mut cx = noop_cx();
+    assert!(arq.poll_op(&mut cx, &mut Op::Shutdown).is_pending());
+    let mut both = wire_dat(0, b"peer");
+    both.extend(wire_ack(1));
+    let res = poll_with_waiting(&mut arq, both, &mut Op::Shutdown);
+    assert!(matches!(res, Poll::Ready(Ok(OpOut::Done))), "{res:?}");
+    assert_eq!(clock.0.borrow().now, Duration::ZERO);
+    assert_eq!(arq.retx, 0);
+}
+
+fn reach_done(arq: &mut TestArq) {
+    let mut cx = noop_cx();
+    arq.channel.rx.extend(wire_fin(0, b"x"));
+    let mut buf = [0u8; 8];
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+        Poll::Ready(Ok(OpOut::Read(1)))
+    ));
+    assert!(arq.poll_op(&mut cx, &mut Op::Shutdown).is_pending());
+    arq.channel.rx.extend(wire_ack(1));
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Shutdown),
+        Poll::Ready(Ok(OpOut::Done))
+    ));
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+        Poll::Ready(Ok(OpOut::Read(0)))
+    ));
+    assert_eq!(arq.state, State::Done);
+}
+
+#[test]
+fn duplicate_fin_after_read_eof_is_reacked() {
+    let mut arq = make_arq();
+    let mut cx = noop_cx();
+    arq.channel.rx = wire_fin(0, b"bye");
+    let mut buf = [0u8; 16];
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+        Poll::Ready(Ok(OpOut::Read(3)))
+    ));
+    assert_eq!(sent_acks(&arq), [1]);
+    arq.channel.tx.clear();
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+        Poll::Ready(Ok(OpOut::Read(0)))
+    ));
+    assert_eq!(arq.state, State::RecvDone);
+
+    arq.channel.rx = wire_fin(0, b"bye");
+    for _ in 0..3 {
+        assert!(matches!(
+            arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+            Poll::Ready(Ok(OpOut::Read(0)))
+        ));
+    }
+    assert_eq!(sent_acks(&arq), [1], "duplicate FIN re-acknowledged once");
+    assert_eq!(arq.rn, 1);
+    assert_eq!(arq.read_head, arq.read_tail);
+}
+
+#[test]
+fn completed_endpoint_reacks_duplicate_fin_without_reopening() {
+    let mut arq = make_arq();
+    let mut cx = noop_cx();
+    reach_done(&mut arq);
+    arq.channel.tx.clear();
+    arq.channel.rx = wire_fin(0, b"x");
+    let mut buf = [0u8; 8];
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+        Poll::Ready(Ok(OpOut::Read(0)))
+    ));
+    assert_eq!(sent_acks(&arq), [1]);
+    assert!(sent_data(&arq).is_empty());
+    assert_eq!(
+        (arq.rn, arq.read_head, arq.read_tail),
+        (1, arq.read_tail, arq.read_tail)
+    );
+    assert_eq!(arq.state, State::Done);
+    assert!(matches!(
+        arq.poll_op(&mut cx, &mut Op::Write { buf: b"no" }),
+        Poll::Ready(Err(ArqError::Closed))
+    ));
+}
+
+#[test]
+fn repeated_completion_operations_are_inert() {
+    let mut arq = make_arq();
+    let mut cx = noop_cx();
+    reach_done(&mut arq);
+    let sent = arq.channel.tx.len();
+    let mut buf = [0u8; 8];
+    for _ in 0..3 {
+        assert!(matches!(
+            arq.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+            Poll::Ready(Ok(OpOut::Read(0)))
+        ));
+        assert!(matches!(
+            arq.poll_op(&mut cx, &mut Op::Flush),
+            Poll::Ready(Ok(OpOut::Done))
+        ));
+        assert!(matches!(
+            arq.poll_op(&mut cx, &mut Op::Shutdown),
+            Poll::Ready(Ok(OpOut::Done))
+        ));
+    }
+    assert_eq!(arq.channel.tx.len(), sent, "nothing new transmitted");
+    assert_eq!(sent_sns(&arq), [0], "a single FIN");
+    assert_eq!(arq.state, State::Done);
 }

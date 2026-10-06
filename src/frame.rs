@@ -201,19 +201,19 @@ impl Frame {
             Frame::Dat(d)
         }
     }
-    pub(crate) fn wire_len<B: AckCodec<M>, const M: usize, C: Crc16>(
-        crc: &C,
-        bytes: &[u8],
-    ) -> Result<usize, FrameError> {
-        let cw: Option<[u8; M]> = bytes.get(0..M).and_then(|s| s.try_into().ok());
-        if let Some(cw) = &cw {
-            if B::decode_ack(crc, cw).is_ok() {
-                return Ok(M);
-            }
-        }
-        match bytes.first().copied().map(|b| b & 0b11) {
+    /// Wire length of an ACK: one type byte followed by the codeword.
+    pub(crate) const fn ack_wire_len<const M: usize>() -> usize {
+        const { assert!(M < MAX_FRAME) };
+        1 + M
+    }
+
+    /// Length of the frame starting at `bytes[0]`, decided by the type bits
+    /// of the first byte only.
+    pub(crate) fn wire_len<const M: usize>(bytes: &[u8]) -> Result<usize, FrameError> {
+        match bytes.first().map(|b| b & 0b11) {
             None => Err(FrameError::TooShort(0)),
-            Some(TYPE_DAT) | Some(TYPE_DAT_ACK_REQ) | Some(TYPE_FIN) => {
+            Some(TYPE_ACK) => Ok(Self::ack_wire_len::<M>()),
+            Some(_) => {
                 if bytes.len() < 3 {
                     return Err(FrameError::TooShort(bytes.len()));
                 }
@@ -223,25 +223,23 @@ impl Frame {
                 }
                 Ok(5 + len)
             }
-            Some(t) => Err(FrameError::InvalidType(t)),
         }
     }
 
+    /// Decodes exactly one frame; `bytes` must be the whole frame.
     pub(crate) fn from_bytes<B: AckCodec<M>, const M: usize, C: Crc16>(
         crc: &C,
         bytes: &[u8],
     ) -> Result<Self, FrameError> {
-        let cw: Option<[u8; M]> = bytes.get(0..M).and_then(|s| s.try_into().ok());
-        if let Some(cw) = &cw {
-            if let Ok(ack) = B::decode_ack(crc, cw) {
-                return Ok(Frame::Ack(ack));
+        match bytes.first().ok_or(FrameError::TooShort(0))? & 0b11 {
+            TYPE_ACK => {
+                let want = Self::ack_wire_len::<M>();
+                let Ok(cw) = <&[u8; M]>::try_from(&bytes[1..]) else {
+                    return Err(FrameError::LengthMismatch(want, bytes.len()));
+                };
+                Ok(Frame::Ack(B::decode_ack(crc, cw)?))
             }
-        }
-        match bytes.first().copied().ok_or(FrameError::TooShort(0))? & 0b11 {
-            TYPE_DAT | TYPE_DAT_ACK_REQ | TYPE_FIN => {
-                Ok(Frame::from_dat(DatFrame::from_bytes(crc, bytes)?))
-            }
-            t => Err(FrameError::InvalidType(t)),
+            _ => Ok(Frame::from_dat(DatFrame::from_bytes(crc, bytes)?)),
         }
     }
 
@@ -252,8 +250,9 @@ impl Frame {
         match self {
             Frame::Ack(ack) => {
                 let cw = B::encode_ack(ack)?;
-                buf[0..M].copy_from_slice(&cw);
-                Ok(M)
+                buf[0] = TYPE_ACK;
+                buf[1..=M].copy_from_slice(&cw);
+                Ok(Self::ack_wire_len::<M>())
             }
             Frame::Dat(d) | Frame::DatAckReq(d) | Frame::Fin(d) => Ok(d.to_bytes(buf)),
         }

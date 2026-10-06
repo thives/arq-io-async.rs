@@ -22,12 +22,14 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - run: |
-            cargo nextest r --features embedded-io
-            cargo nextest r --features tokio
+            cargo nextest r
             cargo nextest r --all-features
-            cargo test --doc --features embedded-io
-            cargo test --doc --features tokio
+            cargo nextest r --no-default-features --features embedded-io
+            cargo nextest r --no-default-features --features embedded-io,std
             cargo test --doc
+            cargo test --doc --all-features
+            cargo test --doc --no-default-features --features embedded-io
+            cargo test --doc --no-default-features --features embedded-io,std
 
   cross-check:
     name: Check Cross-Compilation
@@ -42,7 +44,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: "armv7-unknown-linux-gnueabihf, thumbv7em-none-eabihf"
-      - run: cargo check --release --target=${{matrix.target}} --no-default-features
+      - run: cargo check --release --target=${{matrix.target}} --no-default-features --features embedded-io
 
   fmt:
     name: Check formatting
@@ -81,4 +83,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-features --all-targets -- -D warnings
