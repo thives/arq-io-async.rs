@@ -67,8 +67,8 @@ fn colliding_data_frames_are_delivered() {
         let sn = DatFrame::from_bytes(&crc16(), &bytes).unwrap().sn();
         let mut arq = make_arq();
         arq.set_seq(sn);
-        arq.channel.rx.extend(&bytes);
-        arq.channel.rx.extend(wire_fin((sn + 1) % MAX_SEQ, b""));
+        arq.channel.rx.push(bytes.clone());
+        arq.channel.rx.push(wire_fin((sn + 1) % MAX_SEQ, b""));
         let mut got = Vec::new();
         let mut cx = noop_cx();
         for _ in 0..20 {
@@ -117,32 +117,4 @@ fn every_frame_type_roundtrips() {
         assert_eq!(d.payload(), payload);
         assert_eq!(encode_frame(&frame), bytes);
     }
-}
-
-#[test]
-fn stream_parser_handles_byte_fragments() {
-    let a = colliding_dat(11);
-    let sn = DatFrame::from_bytes(&crc16(), &a).unwrap().sn();
-    let mut link = TrickleLink::new();
-    link.push(wire_ack(0));
-    link.push(a.clone());
-    link.push(wire_ack(0));
-    link.push(wire_fin((sn + 1) % MAX_SEQ, b"!"));
-    let mut arq = new_arq(link);
-    arq.set_seq(sn);
-    let mut cx = noop_cx();
-    let mut got = Vec::new();
-    for _ in 0..1000 {
-        let mut buf = [0u8; 64];
-        let mut op = Op::Read { buf: &mut buf };
-        match arq.poll_op(&mut cx, &mut op) {
-            Poll::Ready(Ok(OpOut::Read(0))) => break,
-            Poll::Ready(Ok(OpOut::Read(n))) => got.extend_from_slice(&buf[..n]),
-            Poll::Ready(other) => panic!("unexpected read: {other:?}"),
-            Poll::Pending => {}
-        }
-    }
-    let mut expect = a[5..].to_vec();
-    expect.push(b'!');
-    assert_eq!(got, expect);
 }

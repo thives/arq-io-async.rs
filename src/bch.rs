@@ -19,13 +19,19 @@ pub fn encode(word: u16) -> u64 {
 /// codec does.
 pub fn decode(bits: u64) -> Option<(u16, usize)> {
     let word = bits >> 1;
-    Errors::new(syndromes(word)).map(|(nerr, errs)| {
-        let fixed = errs.fold(word, |w, (loc, pat)| {
-            assert!(pat.power().unwrap() == 0);
-            w ^ 1 << loc
-        });
-        ((fixed >> 47) as u16, nerr)
-    })
+    let (nerr, mut errs) = Errors::new(syndromes(word))?;
+    let fixed = errs.try_fold(word, |w, err| {
+        let (loc, pat) = err?;
+        if pat.power() != Some(0) {
+            return None;
+        }
+        Some(w ^ 1u64.checked_shl(loc as u32)?)
+    })?;
+    let decoded = (fixed >> 47) as u16;
+    if encode(decoded) >> 1 != fixed {
+        return None;
+    }
+    Some((decoded, nerr))
 }
 
 const GEN: &[u16] = &[
@@ -121,11 +127,16 @@ impl Codeword {
         }
     }
 
-    fn invert(self) -> Codeword {
-        match self.power() {
-            Some(p) => Codeword::for_power(FIELD_SIZE - p),
-            None => panic!("invert zero"),
-        }
+    fn invert(self) -> Option<Codeword> {
+        Some(Codeword::for_power(FIELD_SIZE - self.power()?))
+    }
+
+    fn checked_div(self, rhs: Codeword) -> Option<Codeword> {
+        let q = rhs.power()?;
+        Some(match self.power() {
+            Some(p) => Codeword::for_power(FIELD_SIZE + p - q),
+            None => Codeword::default(),
+        })
     }
 }
 
@@ -152,18 +163,6 @@ impl core::ops::Mul for Codeword {
     }
 }
 
-impl core::ops::Div for Codeword {
-    type Output = Codeword;
-
-    fn div(self, rhs: Codeword) -> Self::Output {
-        match (self.power(), rhs.power()) {
-            (Some(p), Some(q)) => Codeword::for_power(FIELD_SIZE + p - q),
-            (None, Some(_)) => Codeword::default(),
-            (_, None) => panic!("divide by zero"),
-        }
-    }
-}
-
 fn syndromes(word: u64) -> Polynomial {
     Polynomial::new((1..=NUM_SYNDROMES).map(|p| {
         (0..63).fold(Codeword::default(), |s, b| {
@@ -184,8 +183,8 @@ struct Errors {
 
 impl Errors {
     fn new(syn: Polynomial) -> Option<(usize, Self)> {
-        let loc = ErrorLocator::new(syn).build();
-        let errors = loc.degree().expect("invalid error polynomial");
+        let loc = ErrorLocator::new(syn).build()?;
+        let errors = loc.degree()?;
         let mut roots = Polynomial::default();
         let mut nroots = 0;
         for (dest, root) in roots.iter_mut().zip(PolynomialRoots::new(loc)) {
@@ -207,7 +206,7 @@ impl Errors {
 }
 
 impl Iterator for Errors {
-    type Item = (usize, Codeword);
+    type Item = Option<(usize, Codeword)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.pos.next().map(|i| self.descs.for_root(self.roots[i]))
@@ -227,11 +226,11 @@ impl ErrorDescriptions {
         }
     }
 
-    fn for_root(&self, root: Codeword) -> (usize, Codeword) {
-        (
-            root.invert().power().unwrap(),
-            self.vals.eval(root) / self.deriv.eval(root),
-        )
+    fn for_root(&self, root: Codeword) -> Option<(usize, Codeword)> {
+        Some((
+            root.invert()?.power()?,
+            self.vals.eval(root).checked_div(self.deriv.eval(root))?,
+        ))
     }
 }
 
@@ -252,15 +251,17 @@ impl Polynomial {
         self.coefs.get(idx).copied().unwrap_or_default()
     }
 
-    fn shift(mut self) -> Polynomial {
-        assert!(self.constant().zero());
-        self.coefs[self.start] = Codeword::default();
+    fn shift(mut self) -> Option<Polynomial> {
+        let constant = self.coefs.get_mut(self.start)?;
+        if !constant.zero() {
+            return None;
+        }
         self.start += 1;
-        self
+        Some(self)
     }
 
     fn constant(&self) -> Codeword {
-        self.coefs[self.start]
+        self.get(self.start)
     }
 
     fn unit_power(n: usize) -> Self {
@@ -271,7 +272,7 @@ impl Polynomial {
 
     fn degree(&self) -> Option<usize> {
         let deg = self.coefs.iter().rposition(|c| !c.zero())?;
-        Some(deg - self.start)
+        deg.checked_sub(self.start)
     }
 
     fn coef(&self, i: usize) -> Codeword {
@@ -377,19 +378,19 @@ impl ErrorLocator {
         }
     }
 
-    fn build(mut self) -> Polynomial {
+    fn build(mut self) -> Option<Polynomial> {
         for _ in 0..NUM_SYNDROMES {
-            self.step();
+            self.step()?;
         }
-        self.p_cur
+        Some(self.p_cur)
     }
 
-    fn step(&mut self) {
+    fn step(&mut self) -> Option<()> {
         let (save, q, p, d) = if self.q_cur.constant().zero() {
             self.reduce()
         } else {
             self.transform()
-        };
+        }?;
         if save {
             self.q_saved = self.q_cur;
             self.p_saved = self.p_cur;
@@ -398,25 +399,26 @@ impl ErrorLocator {
         self.q_cur = q;
         self.p_cur = p;
         self.deg_cur = d;
+        Some(())
     }
 
-    fn reduce(&mut self) -> (bool, Polynomial, Polynomial, usize) {
-        (
+    fn reduce(&mut self) -> Option<(bool, Polynomial, Polynomial, usize)> {
+        Some((
             false,
-            self.q_cur.shift(),
-            self.p_cur.shift(),
+            self.q_cur.shift()?,
+            self.p_cur.shift()?,
             2 + self.deg_cur,
-        )
+        ))
     }
 
-    fn transform(&mut self) -> (bool, Polynomial, Polynomial, usize) {
-        let mult = self.q_cur.constant() / self.q_saved.constant();
-        (
+    fn transform(&mut self) -> Option<(bool, Polynomial, Polynomial, usize)> {
+        let mult = self.q_cur.constant().checked_div(self.q_saved.constant())?;
+        Some((
             self.deg_cur >= self.deg_saved,
-            (self.q_cur + self.q_saved * mult).shift(),
-            (self.p_cur + self.p_saved * mult).shift(),
+            (self.q_cur + self.q_saved * mult).shift()?,
+            (self.p_cur + self.p_saved * mult).shift()?,
             2 + core::cmp::min(self.deg_cur, self.deg_saved),
-        )
+        ))
     }
 }
 
@@ -465,6 +467,42 @@ mod test {
     use super::*;
 
     #[test]
+    fn invalid_field_operations_return_none() {
+        let zero = Codeword::default();
+        let one = Codeword::for_power(0);
+        assert!(zero.invert().is_none());
+        assert!(zero.checked_div(zero).is_none());
+        assert!(one.checked_div(zero).is_none());
+        assert!(zero.checked_div(one).unwrap().zero());
+        for power in 0..FIELD_SIZE {
+            let value = Codeword::for_power(power);
+            assert_eq!((value * value.invert().unwrap()).power(), Some(0));
+            assert_eq!(value.checked_div(value).unwrap().power(), Some(0));
+        }
+    }
+
+    #[test]
+    fn invalid_polynomial_operations_return_none() {
+        assert!(Polynomial::unit_power(0).shift().is_none());
+        let mut empty = Polynomial::default();
+        for _ in 0..NUM_COEFFS {
+            empty = empty.shift().unwrap();
+        }
+        assert!(empty.shift().is_none());
+        assert!(empty.constant().zero());
+        assert!(empty.degree().is_none());
+
+        let mut locator = ErrorLocator::new(Polynomial::default());
+        locator.q_cur = Polynomial::unit_power(0);
+        locator.q_saved = Polynomial::default();
+        assert!(locator.build().is_none());
+
+        let descs = ErrorDescriptions::new(Polynomial::unit_power(0), Polynomial::unit_power(2));
+        assert!(descs.for_root(Codeword::default()).is_none());
+        assert!(descs.for_root(Codeword::for_power(0)).is_none());
+    }
+
+    #[test]
     fn test_encode() {
         assert_eq!(
             encode(0b1111111100000000),
@@ -511,8 +549,8 @@ mod test {
             decode(encode(0b0000001111111111) ^ 0b00100101010101000010001100100010011111111110)
                 .is_none()
         );
-        for i in 0..1u32 << 17 {
-            assert_eq!(decode(encode(i as u16)).unwrap().0, i as u16);
+        for i in 0..=u16::MAX {
+            assert_eq!(decode(encode(i)).unwrap().0, i);
         }
     }
 }

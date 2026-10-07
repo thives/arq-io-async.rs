@@ -24,12 +24,10 @@ jobs:
       - run: |
             cargo nextest r
             cargo nextest r --all-features
-            cargo nextest r --no-default-features --features embedded-io
-            cargo nextest r --no-default-features --features embedded-io,std
+            cargo nextest r --no-default-features
             cargo test --doc
             cargo test --doc --all-features
-            cargo test --doc --no-default-features --features embedded-io
-            cargo test --doc --no-default-features --features embedded-io,std
+            cargo test --doc --no-default-features
 
   cross-check:
     name: Check Cross-Compilation
@@ -44,7 +42,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: "armv7-unknown-linux-gnueabihf, thumbv7em-none-eabihf"
-      - run: cargo check --release --target=${{matrix.target}} --no-default-features --features embedded-io
+      - run: cargo check --release --target=${{matrix.target}} --no-default-features
 
   fmt:
     name: Check formatting
@@ -71,8 +69,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: |
-            RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --features embedded-io
-            RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --features tokio
             RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --all-features
 
   clippy:

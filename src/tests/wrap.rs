@@ -6,10 +6,10 @@ use super::*;
 use crate::MAX_SEQ;
 use crate::frame::MAX_PAYLOAD;
 
-type WArq<const N: usize, const R: usize, L> = Arq<N, 16, R, L, Crc16X25, BchAckCodec, ManualTimer>;
+type WArq<const N: usize, L> = Arq<N, 16, L, Crc16X25, BchAckCodec, ManualTimer>;
 
-fn wrap_arq<const N: usize, const R: usize, L>(link: L, clock: &Clock, sn: u16) -> WArq<N, R, L> {
-    let mut arq = ArqLayer::<N, Crc16X25, BchAckCodec>::new().build_with_timer(link, clock.timer());
+fn wrap_arq<const N: usize, L: Transport>(link: L, clock: &Clock, sn: u16) -> WArq<N, L> {
+    let mut arq = ArqLayer::<N, Crc16X25, BchAckCodec>::new().build(link, clock.timer());
     arq.set_seq(sn);
     arq
 }
@@ -30,23 +30,9 @@ fn data_frames(tx: &[u8]) -> Vec<(u16, Vec<u8>)> {
         .collect()
 }
 
-fn acks(tx: &[u8]) -> Vec<u16> {
-    parse_stream(tx)
-        .into_iter()
-        .filter_map(|f| match f {
-            Frame::Ack(a) => Some(a.an()),
-            _ => None,
-        })
-        .collect()
-}
-
 /// Queues `count` full frames, the `k`-th filled with byte `tag + k`, and
 /// sends them without waiting for acknowledgements.
-fn send_full_frames<const N: usize, const R: usize>(
-    arq: &mut WArq<N, R, MockLink>,
-    count: usize,
-    tag: u8,
-) {
+fn send_full_frames<const N: usize>(arq: &mut WArq<N, MockLink>, count: usize, tag: u8) {
     let mut cx = noop_cx();
     for k in 0..count {
         let chunk = [tag + k as u8; MAX_PAYLOAD];
@@ -59,7 +45,7 @@ fn send_full_frames<const N: usize, const R: usize>(
     poll_read_pending(arq);
 }
 
-fn poll_read_pending<const N: usize, const R: usize>(arq: &mut WArq<N, R, MockLink>) {
+fn poll_read_pending<const N: usize>(arq: &mut WArq<N, MockLink>) {
     let mut cx = noop_cx();
     let mut buf = [0u8; 1];
     for _ in 0..2 * N + 2 {
@@ -68,7 +54,7 @@ fn poll_read_pending<const N: usize, const R: usize>(arq: &mut WArq<N, R, MockLi
     }
 }
 
-fn read_all<const N: usize, const R: usize>(arq: &mut WArq<N, R, MockLink>) -> Vec<u8> {
+fn read_all<const N: usize>(arq: &mut WArq<N, MockLink>) -> Vec<u8> {
     let mut cx = noop_cx();
     let mut got = Vec::new();
     let mut buf = [0u8; 512];
@@ -86,7 +72,7 @@ fn read_all<const N: usize, const R: usize>(arq: &mut WArq<N, R, MockLink>) -> V
 #[test]
 fn ring_addresses_window_across_wrap() {
     let crc = crc16();
-    let mut ring = crate::Ring::<6>::new();
+    let mut ring = crate::arq::Ring::<6>::new();
     ring.base = 16380;
     let sns = [16380, 16381, 16382, 16383, 0, 1];
     for sn in sns {
@@ -115,7 +101,7 @@ fn ring_addresses_window_across_wrap() {
         assert_eq!(ring.get(sn).unwrap().payload(), sn.to_le_bytes());
     }
     // Advancing over an empty slot keeps later frames at their sequence.
-    let mut ring = crate::Ring::<6>::new();
+    let mut ring = crate::arq::Ring::<6>::new();
     ring.base = 16382;
     assert!(ring.insert(DatFrame::new_dat(&crc, 1, b"b")));
     assert!(ring.advance().is_none());
@@ -129,7 +115,7 @@ fn ring_addresses_window_across_wrap() {
 fn full_send_window_across_wrap_retransmits_original_frames() {
     let clock = Clock::default();
     let start = MAX_SEQ - 4;
-    let mut arq: WArq<6, { r::<6>() }, _> = wrap_arq(MockLink::new(), &clock, start);
+    let mut arq: WArq<6, _> = wrap_arq(MockLink::new(), &clock, start);
     send_full_frames(&mut arq, 6, 10);
     let first = data_frames(&arq.channel.tx);
     let expect: Vec<u16> = (0..6).map(|k| seq(start, k)).collect();
@@ -153,7 +139,7 @@ fn full_send_window_across_wrap_retransmits_original_frames() {
 fn cumulative_ack_across_wrap_keeps_remaining_frames() {
     let clock = Clock::default();
     let start = MAX_SEQ - 2;
-    let mut arq: WArq<6, { r::<6>() }, _> = wrap_arq(MockLink::new(), &clock, start);
+    let mut arq: WArq<6, _> = wrap_arq(MockLink::new(), &clock, start);
     send_full_frames(&mut arq, 6, 20);
     // Acknowledge MAX_SEQ-2, MAX_SEQ-1, 0 and 1.
     arq.channel.rx.extend(wire_ack(2));
@@ -173,7 +159,7 @@ fn cumulative_ack_across_wrap_keeps_remaining_frames() {
 fn ack_during_retransmission_across_wrap() {
     let clock = Clock::default();
     let start = MAX_SEQ - 3;
-    let mut arq: WArq<6, { r::<6>() }, _> = wrap_arq(MockLink::new(), &clock, start);
+    let mut arq: WArq<6, _> = wrap_arq(MockLink::new(), &clock, start);
     send_full_frames(&mut arq, 6, 30);
     arq.channel.tx.clear();
     clock.advance(arq.rto);
@@ -203,7 +189,7 @@ fn ack_during_retransmission_across_wrap() {
 fn out_of_order_receive_across_wrap() {
     let clock = Clock::default();
     let start = MAX_SEQ - 2;
-    let mut arq: WArq<6, { r::<6>() }, _> = wrap_arq(MockLink::new(), &clock, start);
+    let mut arq: WArq<6, _> = wrap_arq(MockLink::new(), &clock, start);
     // Sequences that share `sn % 6` with buffered predecessors.
     for k in [1usize, 4, 5, 2, 3] {
         arq.channel.rx.extend(wire_dat(seq(start, k), &[k as u8]));
@@ -218,17 +204,17 @@ fn out_of_order_receive_across_wrap() {
 fn duplicate_and_stale_frames_around_wrap() {
     let clock = Clock::default();
     let start = MAX_SEQ - 1;
-    let mut arq: WArq<6, { r::<6>() }, _> = wrap_arq(MockLink::new(), &clock, start);
+    let mut arq: WArq<6, _> = wrap_arq(MockLink::new(), &clock, start);
     arq.channel.rx.extend(wire_dat_ack_req(start, b"a"));
     arq.channel.rx.extend(wire_dat_ack_req(0, b"b"));
     assert_eq!(read_all(&mut arq), b"ab");
     assert_eq!(arq.rn, 1);
-    let before = acks(&arq.channel.tx).len();
+    let before = ack_numbers(&arq.channel.tx).len();
     // Stale duplicates from before and after the wrap are re-ACKed only.
     arq.channel.rx.extend(wire_dat(start, b"a"));
     arq.channel.rx.extend(wire_dat(0, b"b"));
     assert!(read_all(&mut arq).is_empty());
-    let after = acks(&arq.channel.tx);
+    let after = ack_numbers(&arq.channel.tx);
     assert!(after.len() > before);
     assert!(after[before..].iter().all(|&an| an == 1));
     // A buffered future frame survives a duplicate of itself.
@@ -239,11 +225,11 @@ fn duplicate_and_stale_frames_around_wrap() {
     assert_eq!(arq.rn, 3);
 }
 
-/// A byte pipe between two instances that accepts every send whole and can
+/// A frame pipe between two instances that accepts every send whole and can
 /// drop selected frames.
 struct Pipe {
-    rx: Rc<RefCell<VecDeque<u8>>>,
-    tx: Rc<RefCell<VecDeque<u8>>>,
+    rx: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    tx: Rc<RefCell<VecDeque<Vec<u8>>>>,
     drop: Box<dyn FnMut(&Frame) -> bool>,
 }
 
@@ -267,32 +253,28 @@ fn pipes(
     )
 }
 
-impl FrameIo for Pipe {
+impl Transport for Pipe {
     type Error = Infallible;
 
-    fn poll_send(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Infallible>> {
+    fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Infallible>> {
         let frames = parse_stream(buf);
         assert_eq!(frames.len(), 1, "a pipe send must carry exactly one frame");
         if !(self.drop)(&frames[0]) {
-            self.tx.borrow_mut().extend(buf);
+            self.tx.borrow_mut().push_back(buf.to_vec());
         }
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_recv(
+    fn poll_read(
         &mut self,
         _cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, Infallible>> {
-        let mut rx = self.rx.borrow_mut();
-        if rx.is_empty() {
+        let Some(frame) = self.rx.borrow_mut().pop_front() else {
             return Poll::Pending;
-        }
-        let n = rx.len().min(buf.len());
-        for (dst, src) in buf.iter_mut().zip(rx.drain(..n)) {
-            *dst = src;
-        }
-        Poll::Ready(Ok(n))
+        };
+        buf[..frame.len()].copy_from_slice(&frame);
+        Poll::Ready(Ok(frame.len()))
     }
 
     fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
@@ -303,7 +285,7 @@ impl FrameIo for Pipe {
 /// Sends `len` bytes from `a` to `b`, starting both at `start`, while the
 /// pipe drops the first transmission of the first two data frames and every
 /// third ACK.
-fn lossy_wrap_transfer<const N: usize, const R: usize>(start: u16, len: usize) {
+fn lossy_wrap_transfer<const N: usize>(start: u16, len: usize) {
     let mut first_seen = Vec::new();
     let mut nacks = 0usize;
     let (pa, pb) = pipes(
@@ -321,8 +303,8 @@ fn lossy_wrap_transfer<const N: usize, const R: usize>(start: u16, len: usize) {
         },
     );
     let clock = Clock::default();
-    let mut a: WArq<N, R, _> = wrap_arq(pa, &clock, start);
-    let mut b: WArq<N, R, _> = wrap_arq(pb, &clock, start);
+    let mut a: WArq<N, _> = wrap_arq(pa, &clock, start);
+    let mut b: WArq<N, _> = wrap_arq(pb, &clock, start);
     let data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
     let mut cx = noop_cx();
     let mut off = 0usize;
@@ -378,7 +360,7 @@ macro_rules! wrap_transfers {
             #[test]
             fn $name() {
                 for back in [1u16, $n / 2, $n, $n + 1] {
-                    lossy_wrap_transfer::<$n, { r::<$n>() }>(MAX_SEQ - back, ($n * 3 + 1) * MAX_PAYLOAD);
+                    lossy_wrap_transfer::<$n>(MAX_SEQ - back, ($n * 3 + 1) * MAX_PAYLOAD);
                 }
             }
         )*

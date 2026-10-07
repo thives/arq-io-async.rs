@@ -8,21 +8,23 @@ use core::fmt;
 pub enum ArqError<E> {
     /// An I/O error from the underlying channel.
     Io(E),
-    /// Received data could not be split into frames, or a frame failed
-    /// validation, and the byte stream cannot be resynchronized, e.g. an
-    /// unknown frame type, an impossible length or a bad CRC; see
-    /// [`FrameError`].
+    /// A frame failed validation; see [`FrameError`].
     ///
-    /// Over a framing transport, invalid frames are discarded and recovered by
-    /// retransmission instead of being reported.
+    /// The layer discards invalid received frames and recovers by
+    /// retransmission, so it does not currently report this variant itself.
     Framing(FrameError),
-    /// An ACK frame could not be decoded; see [`AckError`].
+    /// An outgoing ACK frame could not be encoded; see [`AckError`].
+    ///
+    /// Invalid received ACKs are discarded and never reported.
     InvalidAck(AckError),
-    /// An ACK was not received in time.
+    /// The retransmission retry limit was exhausted without ACK progress.
     Timeout,
-    /// The link is closed: the channel reached end-of-stream or the link has
-    /// been shut down.
+    /// The link is closed: the lower transport reached end-of-stream or
+    /// stopped accepting writes, or the link has been shut down.
     Closed,
+    /// The lower transport accepted a different number of bytes than the
+    /// complete frame it was given.
+    WriteLength,
 }
 
 impl<E: fmt::Display> fmt::Display for ArqError<E> {
@@ -33,6 +35,7 @@ impl<E: fmt::Display> fmt::Display for ArqError<E> {
             ArqError::InvalidAck(error) => write!(f, "ack error: {}", error),
             ArqError::Timeout => write!(f, "arq ack timeout"),
             ArqError::Closed => write!(f, "arq link closed"),
+            ArqError::WriteLength => write!(f, "lower transport did not accept the whole frame"),
         }
     }
 }
@@ -46,6 +49,9 @@ impl<E: defmt::Format> defmt::Format for ArqError<E> {
             ArqError::InvalidAck(error) => defmt::write!(f, "ack error: {}", error),
             ArqError::Timeout => defmt::write!(f, "arq ack timeout"),
             ArqError::Closed => defmt::write!(f, "arq link closed"),
+            ArqError::WriteLength => {
+                defmt::write!(f, "lower transport did not accept the whole frame")
+            }
         }
     }
 }
@@ -70,8 +76,7 @@ pub enum FrameError {
     /// The frame's declared length does not match the number of bytes
     /// received: `(declared, received)`.
     LengthMismatch(usize, usize),
-    /// The frame's type bits are not a known frame type.
-    InvalidType(u8),
+
     /// The frame's type does not match what was expected.
     TypeMismatch,
 }
@@ -97,7 +102,7 @@ impl fmt::Display for FrameError {
                 "frame length mismatch: expected {} vs. actual {}",
                 expected, actual
             ),
-            FrameError::InvalidType(t) => write!(f, "invalid frame type: {}", t),
+
             FrameError::TypeMismatch => write!(f, "frame type mismatch"),
         }
     }
@@ -125,7 +130,7 @@ impl defmt::Format for FrameError {
                 expected,
                 actual
             ),
-            FrameError::InvalidType(t) => defmt::write!(f, "invalid frame type: {}", t),
+
             FrameError::TypeMismatch => defmt::write!(f, "frame type mismatch"),
         }
     }

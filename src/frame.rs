@@ -9,16 +9,18 @@ use crate::{
 /// Sequence numbers are 14 bits and wrap around at this value.
 pub const MAX_SEQ: u16 = 1 << 14;
 
-// Wire format (all multi-byte fields are big-endian):
+// Wire format (ranges are half-open):
 //
 // ACK:
-//   [0..M]  BCH codeword (M bytes)
+//   [0]       type byte (0b01)
+//   [1..1+M]  ACK codec codeword (M bytes); the default BCH codec stores two
+//             little-endian u64 codewords for the packet identifier and CRC.
 //
 // DAT / DAT+ACK-request / FIN:
-//   [0-1]  an     u16  frame sequence number - 2 bits for type on the low end of the LE u16
-//   [2]    len    u8   payload length
-//   [3-4]  crc16  u16  over bytes [0..4] + payload
-//   [5..]  payload
+//   [0..2]  pkt_id u16 LE: sequence number in bits 2..16, type in bits 0..2
+//   [2]     len    u8: payload length
+//   [3..5]  crc16  u16 LE: over bytes [0..3] followed by the payload
+//   [5..]   payload
 
 pub(crate) const TYPE_DAT_ACK_REQ: u8 = 0b00;
 pub(crate) const TYPE_ACK: u8 = 0b01;
@@ -205,25 +207,6 @@ impl Frame {
     pub(crate) const fn ack_wire_len<const M: usize>() -> usize {
         const { assert!(M < MAX_FRAME) };
         1 + M
-    }
-
-    /// Length of the frame starting at `bytes[0]`, decided by the type bits
-    /// of the first byte only.
-    pub(crate) fn wire_len<const M: usize>(bytes: &[u8]) -> Result<usize, FrameError> {
-        match bytes.first().map(|b| b & 0b11) {
-            None => Err(FrameError::TooShort(0)),
-            Some(TYPE_ACK) => Ok(Self::ack_wire_len::<M>()),
-            Some(_) => {
-                if bytes.len() < 3 {
-                    return Err(FrameError::TooShort(bytes.len()));
-                }
-                let len = bytes[2] as usize;
-                if len > MAX_PAYLOAD {
-                    return Err(FrameError::TooLong(len));
-                }
-                Ok(5 + len)
-            }
-        }
     }
 
     /// Decodes exactly one frame; `bytes` must be the whole frame.

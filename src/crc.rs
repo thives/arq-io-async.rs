@@ -30,9 +30,20 @@ impl_crc16!(crc::Crc<u16>, crc::Crc<u16, crc::NoTable>, crc::Crc<u16, crc::Table
 
 #[cfg(test)]
 mod tests {
+    use super::Crc16;
+
+    fn check<C: Crc16>(crc: &C) {
+        // CRC-16/X-25 check value over the concatenated chunks.
+        assert_eq!(crc.checksum_concat([b"123456789"]), 0x906E);
+        assert_eq!(crc.checksum_concat([b"1234", b"", b"56789"]), 0x906E);
+        assert_eq!(crc.checksum_concat([b"", b"123456789", b""]), 0x906E);
+        assert_eq!(crc.checksum_concat([b"1", b"2", b"3", b"456789"]), 0x906E);
+    }
+
     #[test]
-    fn crc16_x25_check_value() {
-        let crc = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
-        assert_eq!(crc.checksum(b"123456789"), 0x906E);
+    fn checksum_concat_spans_chunks_for_every_table_size() {
+        check(&crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC));
+        check(&crc::Crc::<u16, crc::NoTable>::new(&crc::CRC_16_IBM_SDLC));
+        check(&crc::Crc::<u16, crc::Table<16>>::new(&crc::CRC_16_IBM_SDLC));
     }
 }
