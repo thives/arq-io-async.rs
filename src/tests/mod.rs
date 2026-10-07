@@ -1262,6 +1262,7 @@ fn channel_send_eof_is_closed() {
         arq.poll_op(&mut cx, &mut op),
         Poll::Ready(Err(ArqError::Closed))
     ));
+    assert!(arq.failed);
 }
 
 /// A link whose write side holds at most `cap` bytes; a frame that does not

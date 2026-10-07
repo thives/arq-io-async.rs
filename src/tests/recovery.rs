@@ -18,6 +18,7 @@ struct RecoveryLink {
     tx: Vec<u8>,
     fail_send: bool,
     fail_flush: bool,
+    send_zero: bool,
     calls: [usize; 3],
 }
 
@@ -38,7 +39,9 @@ impl Transport for RecoveryLink {
 
     fn poll_write(&mut self, _: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Fault>> {
         self.calls[1] += 1;
-        if self.fail_send {
+        if self.send_zero {
+            Poll::Ready(Ok(0))
+        } else if self.fail_send {
             Poll::Ready(Err(Fault::Send))
         } else {
             self.tx.extend_from_slice(buf);
@@ -207,6 +210,51 @@ fn send_and_flush_errors_preserve_buffered_data_even_if_nonread_takes_error() {
             assert_closed(&mut arq);
             assert_eq!(arq.channel.calls, calls);
         }
+    }
+}
+
+#[test]
+fn lower_zero_write_is_terminal_and_preserves_buffered_data() {
+    for nonread in [false, true] {
+        let mut arq = new_arq(RecoveryLink::default());
+        assert!(matches!(
+            arq.poll_op(
+                &mut noop_cx(),
+                &mut Op::Write {
+                    buf: b"outstanding"
+                }
+            ),
+            Poll::Ready(Ok(OpOut::Write(11)))
+        ));
+        assert!(arq.poll_op(&mut noop_cx(), &mut Op::Flush).is_pending());
+        assert!(arq.timer_running);
+        let expected = queued_payload(&mut arq.channel);
+        arq.channel.send_zero = true;
+        let mut first = [0; 19];
+        let result = if nonread {
+            arq.poll_op(&mut noop_cx(), &mut Op::Flush)
+        } else {
+            arq.poll_op(&mut noop_cx(), &mut Op::Read { buf: &mut first })
+        };
+        assert_failed(&arq);
+        let calls = arq.channel.calls;
+        if nonread {
+            assert!(matches!(result, Poll::Ready(Err(ArqError::Closed))));
+            assert!(arq.terminal_error.is_none());
+            drain(&mut arq, &expected);
+        } else {
+            assert!(matches!(result, Poll::Ready(Ok(OpOut::Read(19)))));
+            assert_eq!(first, expected[..19]);
+            assert!(matches!(arq.terminal_error, Some(ArqError::Closed)));
+            drain(&mut arq, &expected[19..]);
+            assert!(matches!(
+                arq.poll_op(&mut noop_cx(), &mut Op::Read { buf: &mut first }),
+                Poll::Ready(Err(ArqError::Closed))
+            ));
+            assert!(arq.terminal_error.is_none());
+        }
+        assert_closed(&mut arq);
+        assert_eq!(arq.channel.calls, calls);
     }
 }
 
@@ -764,4 +812,78 @@ fn flush_does_not_convert_nonfinal_outgoing_data() {
         Poll::Ready(Ok(false))
     ));
     assert_eq!(arq.channel.tx, expected);
+}
+
+#[test]
+fn corrupt_ack_is_ignored_then_timeout_retransmission_completes_flush() {
+    let mut tx = make_arq();
+    let mut rx = make_arq();
+    let mut cx = noop_cx();
+
+    assert!(matches!(
+        tx.poll_op(&mut cx, &mut Op::Write { buf: b"payload" }),
+        Poll::Ready(Ok(OpOut::Write(7)))
+    ));
+    assert!(tx.poll_op(&mut cx, &mut Op::Flush).is_pending());
+    assert_eq!(tx.channel.sent.len(), 1);
+    assert_eq!(tx.w, 1);
+    assert!(tx.timer_running);
+
+    rx.channel.rx.push(tx.channel.sent[0].clone());
+    let mut buf = [0; 16];
+    assert!(matches!(
+        rx.poll_op(&mut cx, &mut Op::Read { buf: &mut buf }),
+        Poll::Ready(Ok(OpOut::Read(7)))
+    ));
+    assert_eq!(&buf[..7], b"payload");
+    assert_eq!(rx.channel.sent.len(), 1);
+    let ack = rx.channel.sent[0].clone();
+    assert!(matches!(decode_frame(&ack), Ok(Frame::Ack(a)) if a.an() == 1));
+
+    let mut corrupt = ack.clone();
+    let bad_crc = match decode_frame(&ack) {
+        Ok(Frame::Ack(a)) => a.crc() ^ 1,
+        _ => unreachable!(),
+    };
+    corrupt[9..17].copy_from_slice(&crate::bch::encode(bad_crc).to_le_bytes());
+    assert_eq!(corrupt.len(), ack.len());
+    assert_eq!(corrupt[..9], ack[..9]);
+    assert!(matches!(
+        decode_frame(&corrupt),
+        Err(FrameError::CrcMismatch(..))
+    ));
+
+    tx.channel.rx.push(corrupt);
+    assert!(tx.poll_op(&mut cx, &mut Op::Flush).is_pending());
+    assert!(!tx.failed);
+    assert_eq!(tx.w, 1);
+    assert_eq!(tx.channel.sent.len(), 1);
+    assert!(tx.timer_running);
+
+    expire(&tx);
+    assert!(tx.poll_op(&mut cx, &mut Op::Flush).is_pending());
+    assert_eq!(tx.channel.sent.len(), 2);
+    assert!(matches!(
+        decode_frame(&tx.channel.sent[1]),
+        Ok(Frame::Dat(_) | Frame::DatAckReq(_))
+    ));
+
+    rx.channel.rx.push(tx.channel.sent[1].clone());
+    assert!(
+        rx.poll_op(&mut cx, &mut Op::Read { buf: &mut buf })
+            .is_pending()
+    );
+    assert_eq!(rx.channel.sent.len(), 2);
+    let fresh = rx.channel.sent[1].clone();
+    assert!(matches!(decode_frame(&fresh), Ok(Frame::Ack(a)) if a.an() == 1));
+
+    tx.channel.rx.push(fresh);
+    assert!(matches!(
+        tx.poll_op(&mut cx, &mut Op::Flush),
+        Poll::Ready(Ok(OpOut::Done))
+    ));
+    assert_eq!(tx.w, 0);
+    assert!(!tx.timer_running);
+    assert!(tx.timer.deadline.is_none());
+    assert_eq!(tx.channel.sent.len(), 2);
 }

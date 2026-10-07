@@ -136,7 +136,7 @@ impl DatFrame {
         }
         let len = bytes[2] as usize;
         if bytes.len() != 5 + len {
-            return Err(FrameError::LengthMismatch(len, bytes.len()));
+            return Err(FrameError::LengthMismatch(5 + len, bytes.len()));
         }
         if len > MAX_PAYLOAD {
             return Err(FrameError::TooLong(len));

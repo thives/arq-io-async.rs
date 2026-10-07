@@ -55,6 +55,43 @@ fn complete_data_checks_exact_length_type_and_crc() {
 }
 
 #[test]
+fn length_mismatch_reports_total_wire_lengths() {
+    let dat = wire_dat(0, &[1; 10]);
+    assert_eq!(dat.len(), 15);
+    let mut short = dat.clone();
+    short.pop();
+    assert!(matches!(
+        decode_frame(&short),
+        Err(FrameError::LengthMismatch(15, 14))
+    ));
+    let mut long = dat;
+    long.push(0);
+    assert!(matches!(
+        decode_frame(&long),
+        Err(FrameError::LengthMismatch(15, 16))
+    ));
+    let ack = wire_ack(7);
+    assert_eq!(ack.len(), 17);
+    assert!(matches!(
+        decode_frame(&ack[..16]),
+        Err(FrameError::LengthMismatch(17, 16))
+    ));
+    let mut long = ack;
+    long.push(0);
+    assert!(matches!(
+        decode_frame(&long),
+        Err(FrameError::LengthMismatch(17, 18))
+    ));
+    let mut oversized = vec![0; 256];
+    oversized[0] = TYPE_DAT;
+    oversized[2] = 255;
+    assert!(matches!(
+        decode_frame(&oversized),
+        Err(FrameError::LengthMismatch(260, 256))
+    ));
+}
+
+#[test]
 fn complete_ack_checks_exact_codeword_bch_type_and_crc() {
     let bytes = wire_ack(7);
     assert!(matches!(decode_frame(&bytes), Ok(Frame::Ack(a)) if a.an() == 7));

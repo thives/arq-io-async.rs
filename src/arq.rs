@@ -384,6 +384,7 @@ where
             return self.poll_failed(op);
         }
         match self.poll_op_lower(cx, op) {
+            Poll::Ready(Err(ArqError::Closed)) if self.failed => self.poll_failed(op),
             Poll::Ready(Err(ArqError::Closed)) => Poll::Ready(Err(ArqError::Closed)),
             Poll::Ready(Err(error)) => {
                 self.fail(error);
@@ -830,7 +831,10 @@ where
                     match self.channel.poll_write(cx, &out.buf[..out.total]) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(n)) if n == out.total => out.phase = Phase::Flush,
-                        Poll::Ready(Ok(0)) => return Poll::Ready(Err(ArqError::Closed)),
+                        Poll::Ready(Ok(0)) => {
+                            self.fail(ArqError::Closed);
+                            return Poll::Ready(Err(ArqError::Closed));
+                        }
                         Poll::Ready(Ok(_)) => return Poll::Ready(Err(ArqError::WriteLength)),
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(ArqError::Io(e))),
                     }

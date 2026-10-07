@@ -553,4 +553,16 @@ mod test {
             assert_eq!(decode(encode(i)).unwrap().0, i);
         }
     }
+
+    #[test]
+    fn protected_code_minimum_distance_supports_eleven_errors() {
+        let (min_weight, min_word) = (1..=u16::MAX)
+            .map(|word| ((encode(word) >> 1).count_ones(), word))
+            .min()
+            .unwrap();
+        assert!(
+            min_weight >= 23,
+            "minimum protected weight {min_weight} from input {min_word:#06x}"
+        );
+    }
 }
